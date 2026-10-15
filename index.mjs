@@ -1,0 +1,716 @@
+/**
+ * dsh-ruliu — 百度如流（InfoFlow）↔ DeepSeek Harness 通道插件。
+ *
+ * 入站：如流开放平台把消息事件推到本插件注册的 HTTP 回调路由
+ *       （webServer.register）。每个如流会话（chatId）对应一个 DSH 会话，
+ *       映射持久化在 <profile>/.dsh-ruliu/sessions.json。
+ *
+ * 出站：订阅 DSH 的 `session/event`，把 assistant 的文本回复发回如流
+ *       （群聊会带上被回复消息的 id）。
+ *
+ * 协议细节全部在 lib/ruliu.mjs，这里只做 DSH 侧的桥接。
+ *
+ * 宿主 API 依据（dsh 0.2.0-rc.2）：
+ *   - ctx.webServer.register({ kind, path, handler })    dsh-host-webserver
+ *   - ctx.agents.create(options): Promise<AgentHandle>   dsh-agent
+ *   - ctx.agents.get(sessionId): Agent | undefined       dsh-agent
+ *   - Agent.followup(userMessage)                        dsh-agent
+ *   - ctx.on('session/event', (session, event) => …)     事件 type:
+ *       'turn/start' | 'tool/call' | 'assistant/message' | 'turn/end'
+ *   - 用户消息：本地 createUserMessage() 构造，等价 dsh-llm 的实现
+ *       （deepFreeze(structuredClone({...input, id: uuid}))）—— 这样本插件
+ *       零外部依赖，不受 link: 包的模块解析限制影响。
+ *
+ * @module dsh-ruliu
+ */
+
+import { randomUUID } from 'node:crypto'
+import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { dirname, join } from 'node:path'
+import { createRuliuClient } from './lib/ruliu.mjs'
+
+/** 稳定的 Cordis 插件名。 */
+export const name = 'dsh-ruliu'
+
+/**
+ * webServer 注册回调路由；agents 起/续会话；sessions / sessionPersistence 读会话事实。
+ *
+ * sessionPersistence 必须在这里声明：Cordis 只会把 inject 里列出的服务解析进本 fiber 的
+ * store，属性访问才命中；未声明时 `ctx.sessionPersistence` 直接抛
+ * `cannot get property "sessionPersistence" without inject` —— `?.` 拦不住属性访问本身。
+ * 少了它，/list 只剩内存里的活跃会话（也就是本插件自己建的），持久化里的历史一条都列不出来。
+ */
+export const inject = ['webServer', 'agents', 'sessions', 'sessionPersistence']
+
+/** 单个回调请求体的上限，防止把宿主内存吃满。 */
+const MAX_BODY_BYTES = 1 << 20
+
+/**
+ * 把任意错误值压成一行可读文本（Error / {message,code} 对象 / 字符串都覆盖）。
+ * 之前直接 String(err) 得到 "[object Object]"，什么也看不出。
+ * @param error - 待描述的值。
+ * @returns 一行文本。
+ */
+function describeError(error) {
+  if (error === undefined || error === null) return '(none)'
+  if (typeof error === 'string') return error
+  if (typeof error?.message === 'string' && error.message !== '') {
+    return error.code === undefined ? error.message : `${error.message} (code=${String(error.code)})`
+  }
+  try {
+    return JSON.stringify(error).slice(0, 300)
+  } catch {
+    return String(error)
+  }
+}
+
+/**
+ * 建一个往 `<stateDir>/log.ndjson` 追加结构化事件的日志器。
+ *
+ * 宿主日志不一定落盘，排障需要自己的落地记录：每一行是
+ * `{ at, event, detail }`。日志失败绝不影响主流程。
+ * @param stateDir - 插件的状态目录。
+ * @returns (event, detail) => void。
+ */
+function createFileLog(stateDir) {
+  const file = join(stateDir, 'log.ndjson')
+  let ready = false
+  return (event, detail) => {
+    try {
+      if (!ready) {
+        mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+        ready = true
+      }
+      appendFileSync(file, `${JSON.stringify({ at: new Date().toISOString(), event, detail })}\n`)
+    } catch {
+      /* 记日志失败不该影响对话 */
+    }
+  }
+}
+
+/**
+ * 递归冻结（等价 dsh-llm 的 deepFreeze）。
+ * @param value - 待冻结的值。
+ * @returns 同一个值。
+ */
+function deepFreeze(value) {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.freeze(value)
+    for (const child of Object.values(value)) deepFreeze(child)
+  }
+  return value
+}
+
+/**
+ * 构造一条用户消息，等价于 `@deepseek-ai/dsh-llm` 的 createUserMessage
+ * （该函数就是 deepFreeze(structuredClone({ ...input, id: uuid }))）。
+ *
+ * 内联而不是 import：本插件是 link 到 profile 外的目录，@deepseek-ai/* 的
+ * 解析依赖 loader 的拦截；自带实现让插件零外部依赖，去掉这一层不确定性。
+ * @param input - { content, source }。
+ * @returns 冻结后的用户消息。
+ */
+function createUserMessage(input) {
+  // role 必须显式写：漏掉它会让序列化时 message.role === undefined，provider 里
+  // `previous?.role === wireRole` 在首条消息上即成立（undefined === undefined），
+  // 接着读 previous.content → TypeError → 被包成 TRANSPORT（实测踩过这个坑）。
+  return deepFreeze(structuredClone({ ...input, role: 'user', id: randomUUID() }))
+}
+
+/**
+ * 解析当前 profile 目录，用于存放会话映射。
+ *
+ * 与 dshmarket 同样的做法：$DSH_HOME（空视为未设置）否则 ~/.dsh，
+ * profile 名取自启动参数 `--profile <name>`，缺省 web。
+ * @returns profile 目录的绝对路径。
+ */
+function resolveProfileDir() {
+  const fromEnv = process.env.DSH_HOME
+  const home = fromEnv !== undefined && fromEnv.trim() !== '' ? fromEnv.trim() : join(homedir(), '.dsh')
+  const argv = process.argv
+  const flag = argv.indexOf('--profile')
+  const candidate = flag !== -1 ? argv[flag + 1] : undefined
+  const profile = candidate !== undefined && !candidate.startsWith('-') ? candidate : 'web'
+  return join(home, 'profiles', profile)
+}
+
+/**
+ * 从 assistant 消息里取出纯文本。
+ * @param message - session/event 里 event.data.message。
+ * @returns 拼接后的文本（没有文本块时为空串）。
+ */
+function textOfAssistantMessage(message) {
+  return (message?.content ?? [])
+    .filter((block) => block?.type === 'text')
+    .map((block) => block.text ?? '')
+    .join('\n')
+    .trim()
+}
+
+/**
+ * 读完一个请求体，超过上限即中止。
+ * @param req - Node IncomingMessage。
+ * @returns UTF-8 字符串。
+ */
+function readBody(req) {
+  return new Promise((resolve, reject) => {
+    const chunks = []
+    let size = 0
+    req.on('data', (chunk) => {
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        reject(new Error('dsh-ruliu: request body too large'))
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', reject)
+  })
+}
+
+/**
+ * 写一个响应。
+ * @param res - Node ServerResponse。
+ * @param status - HTTP 状态码。
+ * @param contentType - Content-Type 头。
+ * @param body - 响应体。
+ */
+function send(res, status, contentType, body) {
+  res.writeHead(status, {
+    'content-type': contentType,
+    'cache-control': 'no-store',
+    'content-length': Buffer.byteLength(body),
+  })
+  res.end(body)
+}
+
+/**
+ * chatId → DSH sessionId 的持久映射。
+ *
+ * 只存映射本身，不存消息内容：会话事实由 DSH 自己的会话存储拥有。
+ */
+class SessionMap {
+  /**
+   * @param file - sessions.json 的绝对路径。
+   * @param logger - Cordis logger，可为空。
+   */
+  constructor(file, logger) {
+    this.file = file
+    this.logger = logger
+    this.byChat = new Map()
+    this.bySession = new Map()
+    this.load()
+  }
+
+  /** 从磁盘恢复；文件缺失或损坏都退化为空映射。 */
+  load() {
+    try {
+      const raw = JSON.parse(readFileSync(this.file, 'utf8'))
+      for (const [chatId, sessionId] of Object.entries(raw?.pairs ?? {})) {
+        this.byChat.set(chatId, sessionId)
+        this.bySession.set(sessionId, chatId)
+      }
+    } catch (error) {
+      if (error?.code !== 'ENOENT') {
+        this.logger?.warn?.('dsh-ruliu: 会话映射读取失败，按空映射继续：%s', String(error?.message ?? error))
+      }
+    }
+  }
+
+  /** 落盘；失败只记日志，不影响本轮对话。 */
+  save() {
+    try {
+      mkdirSync(dirname(this.file), { recursive: true, mode: 0o700 })
+      writeFileSync(this.file, JSON.stringify({ pairs: Object.fromEntries(this.byChat) }, null, 2))
+    } catch (error) {
+      this.logger?.warn?.('dsh-ruliu: 会话映射写入失败：%s', String(error?.message ?? error))
+    }
+  }
+
+  /**
+   * @param chatId - 如流会话 id（`private:<uid>` 或 `group:<gid>`）。
+   * @returns 已绑定的 DSH 会话 id，或 undefined。
+   */
+  sessionOf(chatId) {
+    return this.byChat.get(chatId)
+  }
+
+  /**
+   * @param sessionId - DSH 会话 id。
+   * @returns 该会话绑定的如流 chatId，或 undefined。
+   */
+  chatOf(sessionId) {
+    return this.bySession.get(sessionId)
+  }
+
+  /**
+   * 建立绑定并落盘。
+   * @param chatId - 如流会话 id。
+   * @param sessionId - DSH 会话 id。
+   */
+  bind(chatId, sessionId) {
+    this.byChat.set(chatId, sessionId)
+    this.bySession.set(sessionId, chatId)
+    this.save()
+  }
+
+  /**
+   * 解除绑定：下一条消息会开新会话（对应 `/end`、`/new`）。
+   * @param chatId - 如流会话 id。
+   */
+  unbind(chatId) {
+    const sessionId = this.byChat.get(chatId)
+    if (sessionId !== undefined) this.bySession.delete(sessionId)
+    this.byChat.delete(chatId)
+    this.save()
+  }
+}
+
+/**
+ * 注册如流通道。
+ * @param ctx - 携带 webServer / agents / sessions 的插件上下文。
+ * @param config - profile 组合里的行配置（本插件不声明 Config schema，字段即约定）。
+ */
+export function apply(ctx, config = {}) {
+  const logger = ctx.logger
+
+  if (config.enabled !== true) {
+    logger?.info?.('dsh-ruliu: 未启用（config.enabled !== true），跳过挂载')
+    return
+  }
+
+  const client = createRuliuClient(config, logger)
+  if (client === undefined) {
+    logger?.warn?.('dsh-ruliu: 凭证不全（需要 appKey + appSecret），通道未挂载')
+    return
+  }
+
+  const webhookPath = config.webhookPath || '/dsh-ruliu/webhook'
+  const cwd = config.cwd || process.cwd()
+  const stateDir = config.stateDir || join(resolveProfileDir(), '.dsh-ruliu')
+  const sessions = new SessionMap(join(stateDir, 'sessions.json'), logger)
+  const log = createFileLog(stateDir)
+
+  /** chatId → 最近一条入站消息 id，用于群聊的引用回复。 */
+  const lastInboundId = new Map()
+
+  /**
+   * preset id → 已 acquire 的 scope。
+   *
+   * 官方 dsh-webhook 在 agents.create 之前会 `agentPresets.acquireScope(id)`：
+   * 那是引用计数（retain），保证 preset 的组合代次不被回收。不 acquire 的话，
+   * mount 进 agent 世界的行会被回收掉 —— 表现为 agent 的 LLM provider 连接为空
+   * （baseURL undefined → 同步抛错 → 被包成 TRANSPORT，重试 5 次后回合失败）。
+   */
+  const presetScopes = new Map()
+
+  /**
+   * 取（或首次 acquire）某个 preset 的 scope。
+   * @param presets - ctx.agentPresets 服务。
+   * @param id - preset id。
+   * @returns scope，或 undefined（宿主没有 acquireScope 时）。
+   */
+  const acquirePresetScope = async (presets, id) => {
+    if (id === undefined || typeof presets?.acquireScope !== 'function') return undefined
+    const existing = presetScopes.get(id)
+    if (existing !== undefined) return existing
+    const scope = await presets.acquireScope(id)
+    presetScopes.set(id, scope)
+    log('preset-scope-acquired', { presetId: id })
+    return scope
+  }
+
+  // ---- 交互层：斜杠命令 ----
+  //
+  // 交互模型参考 dsh-bridge 的 IM 通道：命令优先于对话；没有活动会话时给出
+  // `/new` / `/list` 的提示，而不是把每条消息都灌进同一个会话。
+
+  /** 最近一次 `/list` 的结果，供 `/use <序号>` 使用。 */
+  let lastListing = []
+
+  /** 命令帮助文本。 */
+  const helpText = () => [
+    '📖 **可用命令**',
+    '',
+    '`/new [提示词]` — 开一个新会话（可带首条提示词）',
+    '`/list` — 列出最近的会话（别名 `/sessions`）',
+    '`/use <序号>` — 把本聊天切到 `/list` 里的某个会话',
+    '`/end` — 结束当前绑定，下条消息会开新会话',
+    '`/status` — 看当前绑定的会话与模型',
+    '`/help` — 显示这条帮助',
+    '',
+    '直接发普通文字就是和当前会话对话。',
+  ].join('\n')
+
+  /**
+   * 给还没有标题的行补上 DSH 的会话标题（`session/title` 事件的折叠结果）。
+   *
+   * `sessionQuery` 故意不写进 inject：它只用来取标题，取不到就退化成「(未命名)」，
+   * 不该因为它缺失就让整条通道挂不上 —— 所以用 `ctx.get()` 软取。
+   * @param rows - listSessions 的行（就地写回 title）。
+   */
+  const fillTitles = async (rows) => {
+    const missing = rows.filter((row) => row.title === '').map((row) => row.id)
+    if (missing.length === 0) return
+    try {
+      const query = ctx.get?.('sessionQuery')
+      if (typeof query?.readTitleSnapshots !== 'function') {
+        log('title-fill-skipped', { reason: 'sessionQuery 不可用', missing: missing.length })
+        return
+      }
+      const results = await query.readTitleSnapshots(missing)
+      const byId = new Map(results.map((result) => [
+        result?.sessionId,
+        result?.status === 'fulfilled' ? result.value?.title?.title ?? '' : '',
+      ]))
+      for (const row of rows) {
+        if (row.title === '') row.title = byId.get(row.id) ?? ''
+      }
+    } catch (error) {
+      log('title-fill-failed', { error: describeError(error) })
+    }
+  }
+
+  /**
+   * 列出可切换的会话：内存里的活跃会话 + 持久化里的历史会话，按时间倒序。
+   *
+   * 坑：`ctx.sessionPersistence` 必须写进 `inject` 才取得到（见文件顶部 inject 的注释）。
+   * 之前这里恒抛，`/list` 就只剩内存里的活跃会话（即本插件自己建的），历史会话一条都没有。
+   * @returns {Promise<Array<{id, title, createdAt, live}>>} 最多 10 条。
+   */
+  const listSessions = async () => {
+    const rows = new Map()
+    try {
+      for (const session of ctx.sessions?.list?.() ?? []) {
+        const id = session?.id
+        if (id === undefined) continue
+        const header = session.header ?? {}
+        // 只列本插件配置的工作目录，避免把整个 home 的会话都倒出来
+        if (cwd !== '' && header.cwd !== undefined && header.cwd !== cwd) continue
+        rows.set(id, { id, title: session.title ?? '', createdAt: header.createdAt ?? 0, live: true })
+      }
+    } catch (error) {
+      log('session-list-failed', { error: describeError(error) })
+    }
+    try {
+      // 快照形状：`{ header, revision, sizeBytes }`（旧版是扁平 header，这里兼容两种）
+      for (const snapshot of (await ctx.sessionPersistence.list()) ?? []) {
+        const header = snapshot?.header ?? snapshot ?? {}
+        if (header.id === undefined || rows.has(header.id)) continue
+        if (cwd !== '' && header.cwd !== undefined && header.cwd !== cwd) continue
+        rows.set(header.id, { id: header.id, title: '', createdAt: header.createdAt ?? 0, live: false })
+      }
+    } catch (error) {
+      log('session-persist-list-failed', { error: describeError(error) })
+    }
+    const listing = [...rows.values()]
+      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+      .slice(0, 10)
+    await fillTitles(listing)
+    return listing
+  }
+
+  /**
+   * 把会话列表渲染成 IM 文本。
+   *
+   * 故意不打印 `session-<uuid>`：那是 DSH 的内部实现细节，IM 里的使用者既读不出
+   * 信息量也用不上 —— 切换靠的是序号（`/use <序号>`），id 只在日志里出现。
+   * @param rows - listSessions 的结果。
+   * @returns 文本。
+   */
+  const renderSessions = (rows) => {
+    if (rows.length === 0) return '还没有任何会话。发送 `/new <提示词>` 开一个。'
+    const lines = ['🗂 **最近的会话**（用 `/use <序号>` 切换）', '']
+    rows.forEach((row, index) => {
+      const when = row.createdAt === 0 ? '' : new Date(row.createdAt).toLocaleString('zh-CN', { hour12: false })
+      const title = row.title === '' ? '(未命名)' : row.title
+      const marks = [row.live ? '🟢 活跃' : '', when].filter((part) => part !== '')
+      lines.push(`${index + 1}. ${title}${marks.length === 0 ? '' : ` · ${marks.join(' · ')}`}`)
+    })
+    return lines.join('\n')
+  }
+
+  /**
+   * 用「标题」而不是 `session-<uuid>` 描述一个绑定的会话：id 是内部实现细节，
+   * 对 IM 里的使用者没有意义（标题取不到就只说绑定状态，不退回打印 id）。
+   * @param id - 绑定的 DSH 会话 id，或 undefined（未绑定）。
+   * @param liveAgent - 该会话在内存里的 agent，或 undefined。
+   * @returns 一句人话。
+   */
+  const describeSession = async (id, liveAgent) => {
+    if (id === undefined) return '(未绑定，下条消息会新建)'
+    const state = liveAgent === undefined ? '（未在内存中，下条消息会 resume）' : '（活跃）'
+    const rows = [{ id, title: '', createdAt: 0, live: false }]
+    await fillTitles(rows)
+    const title = rows[0]?.title ?? ''
+    return title === '' ? `已绑定${state}` : `「${title}」${state}`
+  }
+
+  /**
+   * 处理一条斜杠命令。
+   * @param input - 原始消息文本（已 trim）。
+   * @param chatId - 如流会话 id。
+   * @returns `{ handled: true }` 表示已回复完毕；`{ handled: false, text }` 表示按普通消息继续（text 可能被改写，如 `/new 提示词`）。
+   */
+  const handleCommand = async (input, chatId) => {
+    const spaceAt = input.search(/\s/u)
+    const cmd = (spaceAt === -1 ? input : input.slice(0, spaceAt)).toLowerCase()
+    const arg = spaceAt === -1 ? '' : input.slice(spaceAt).trim()
+
+    if (cmd === '/help' || cmd === '/?') {
+      await client.sendText(chatId, helpText())
+      return { handled: true }
+    }
+
+    if (cmd === '/status') {
+      const bound = sessions.sessionOf(chatId)
+      const liveAgent = bound === undefined ? undefined : ctx.agents.get(bound)
+      await client.sendText(chatId, [
+        '📌 **当前状态**',
+        '',
+        `会话：${await describeSession(bound, liveAgent)}`,
+        `工作目录：\`${cwd}\``,
+      ].join('\n'))
+      return { handled: true }
+    }
+
+    if (cmd === '/list' || cmd === '/sessions') {
+      lastListing = await listSessions()
+      log('command-list', { chatId, count: lastListing.length })
+      await client.sendText(chatId, renderSessions(lastListing))
+      return { handled: true }
+    }
+
+    if (cmd === '/use' || cmd === '/switch' || cmd === '/resume') {
+      const index = Number.parseInt(arg, 10)
+      const picked = Number.isInteger(index) ? lastListing[index - 1] : undefined
+      if (picked === undefined) {
+        lastListing = await listSessions()
+        await client.sendText(chatId, `没找到序号「${arg}」。先看看列表：\n\n${renderSessions(lastListing)}`)
+        return { handled: true }
+      }
+      sessions.bind(chatId, picked.id)
+      log('command-use', { chatId, sessionId: picked.id })
+      const label = picked.title === '' ? `第 ${index} 个会话` : `「${picked.title}」`
+      await client.sendText(chatId, `✅ 已切到${label}\n下一条消息就会进这个会话。`)
+      return { handled: true }
+    }
+
+    if (cmd === '/end') {
+      const bound = sessions.sessionOf(chatId)
+      sessions.unbind(chatId)
+      log('command-end', { chatId, sessionId: bound })
+      await client.sendText(chatId, '🔚 已结束当前绑定。下条消息会开一个新会话（也可以 `/list` + `/use` 切回旧的）。')
+      return { handled: true }
+    }
+
+    if (cmd === '/new') {
+      const bound = sessions.sessionOf(chatId)
+      sessions.unbind(chatId)
+      log('command-new', { chatId, previousSessionId: bound, hasPrompt: arg !== '' })
+      if (arg === '') {
+        await client.sendText(chatId, '🆕 好，下条消息会开一个新会话。')
+        return { handled: true }
+      }
+      return { handled: false, text: arg }
+    }
+
+    // 未知命令：当普通消息交给模型（避免用户以为发出去的是命令）
+    return { handled: false, text: input }
+  }
+
+  /**
+   * 处理一条已解析的入站消息：绑定/复用会话，把文本投成一次用户回合。
+   * @param inbound - parseInbound 返回的 message 结果。
+   */
+  const handleInbound = async (inbound) => {
+    const { chatId, text, messageId } = inbound
+    if (!chatId || !text) return
+    if (messageId !== undefined) lastInboundId.set(chatId, messageId)
+    log('inbound', { chatId, chatType: inbound.chatType, senderId: inbound.senderId, messageId, chars: text.length, preview: text.slice(0, 80) })
+
+    // 命令优先：斜杠开头的先交给命令层，处理完就不再进模型
+    let prompt = text
+    if (text.trim().startsWith('/')) {
+      try {
+        const result = await handleCommand(text.trim(), chatId)
+        log('command', { chatId, input: text.slice(0, 40), handled: result.handled })
+        if (result.handled) return
+        prompt = result.text ?? text
+      } catch (error) {
+        log('command-failed', { chatId, error: describeError(error) })
+        await client.sendText(chatId, `❌ 命令处理失败：${String(error?.message ?? error)}`).catch(() => {})
+        return
+      }
+    }
+
+    try {
+      // 模型/提供商：create 与 resume 都必须显式给（dsh-bridge 两处都传）。
+      // 不给的话回合会立刻以 error 结束 —— 表现为「会话建了/恢复了，但 step 一毫秒就挂」。
+      const agentOptions = {}
+      try {
+        const def = ctx.get?.('agentDefaultModel')?.currentSelection?.()
+        if (def?.provider) agentOptions.provider = def.provider
+        if (def?.model) agentOptions.model = def.model
+        log('agent-options-resolved', { agentOptions, resolved: def !== undefined && def !== null })
+      } catch (error) {
+        log('default-model-unavailable', { error: String(error?.message ?? error) })
+      }
+      const withOptions = Object.keys(agentOptions).length > 0 ? { agentOptions } : {}
+
+      // agent preset 组装（等价 Web 会话控制器的 composeAgent / dsh-bridge 的
+      // _composeAgentPreset）：create 与 resume 都要带 setup。不带的后果是 agent 的
+      // scoped world 不完整 —— 回合能起来、能记 user/message，但 LLM 调用会以
+      // TRANSPORT 失败（实测）。
+      let composition = { agentPreset: undefined, setup: undefined }
+      try {
+        const presets = ctx.get?.('agentPresets')
+        if (typeof presets?.resolve === 'function' && typeof presets?.mount === 'function') {
+          const preset = await presets.resolve(config.agentPreset)
+          // 先 acquire 再 mount —— 顺序与官方 dsh-webhook 一致
+          await acquirePresetScope(presets, preset?.id)
+          composition = {
+            agentPreset: preset?.id,
+            setup: async (agentCtx) => { await presets.mount(agentCtx, preset?.id) },
+          }
+        } else {
+          log('preset-service-unavailable', {})
+        }
+      } catch (error) {
+        log('preset-compose-failed', { error: describeError(error) })
+      }
+      log('preset-composed', { agentPreset: composition.agentPreset, hasSetup: composition.setup !== undefined })
+      const withSetup = composition.setup === undefined ? {} : { setup: composition.setup }
+      const meta = { cwd, ...(composition.agentPreset === undefined ? {} : { agentPreset: composition.agentPreset }) }
+
+      let agent = undefined
+      const known = sessions.sessionOf(chatId)
+      if (known !== undefined) agent = ctx.agents.get(known)
+      // 宿主重启后，已绑定的会话不在内存里：先尝试 resume，失败再新建。
+      if (known !== undefined && agent === undefined && typeof ctx.agents.resume === 'function') {
+        try {
+          const resumed = await ctx.agents.resume({ resumeSessionId: known, ...withOptions, ...withSetup })
+          agent = resumed?.agent
+          if (agent !== undefined) log('session-resumed', { chatId, sessionId: known })
+        } catch (error) {
+          log('resume-failed', { chatId, sessionId: known, error: describeError(error) })
+        }
+      }
+
+      if (agent === undefined) {
+        const sessionId = `session-${globalThis.crypto.randomUUID()}`
+        const handle = await ctx.agents.create({
+          sessionId,
+          meta,
+          ...withOptions,
+          ...withSetup,
+        })
+        agent = handle?.agent
+        if (agent === undefined) throw new Error('agents.create 未返回 agent')
+        const bound = agent.session?.id ?? sessionId
+        sessions.bind(chatId, bound)
+        log('session-created', { chatId, sessionId: bound, agentOptions, meta })
+        logger?.info?.('dsh-ruliu: 为如流会话 %s 新建 DSH 会话 %s', chatId, bound)
+      } else {
+        log('session-reused', { chatId, sessionId: known })
+      }
+
+      agent.followup(createUserMessage({
+        content: [{ type: 'text', text: prompt }],
+        source: { kind: 'user' },
+      }))
+      log('followup-delivered', { chatId })
+    } catch (error) {
+      log('followup-failed', { chatId, error: describeError(error) })
+      logger?.warn?.('dsh-ruliu: 投递失败：%s', String(error?.message ?? error))
+      await client.sendText(chatId, `❌ 投递到 DSH 失败：${String(error?.message ?? error)}`).catch(() => {})
+    }
+  }
+
+  // ---- 入站：如流回调路由 ----
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: webhookPath,
+    handler: async (req, res) => {
+      if (req.method !== 'POST') {
+        send(res, 405, 'text/plain; charset=utf-8', 'Method Not Allowed')
+        return
+      }
+
+      let raw = ''
+      try {
+        raw = await readBody(req)
+      } catch (error) {
+        logger?.warn?.('dsh-ruliu: 读取回调请求体失败：%s', String(error?.message ?? error))
+        send(res, 413, 'text/plain; charset=utf-8', 'payload too large')
+        return
+      }
+      log('webhook-hit', { contentType: String(req.headers?.['content-type'] ?? ''), bytes: raw.length })
+
+      let parsed
+      try {
+        parsed = client.parseInbound(req, raw)
+      } catch (error) {
+        log('parse-threw', { error: String(error?.message ?? error) })
+        logger?.warn?.('dsh-ruliu: 入站解析异常：%s', String(error?.message ?? error))
+        send(res, 500, 'text/plain; charset=utf-8', 'failed to parse message')
+        return
+      }
+
+      // 平台要求的应答（challenge 回显 / 403 / 400 / 500）原样返回
+      if (parsed?.kind === 'reply') {
+        log('respond-reply', { status: parsed.status, body: String(parsed.body).slice(0, 60) })
+        send(res, parsed.status, parsed.contentType, parsed.body)
+        return
+      }
+
+      // 消息与忽略都先秒回 success，再异步处理 —— 如流会重投，别让它等
+      send(res, 200, 'text/plain; charset=utf-8', 'success')
+      if (parsed?.kind === 'message') void handleInbound(parsed)
+      else if (parsed?.kind === 'ignore') log('ignored', { reason: String(parsed.reason ?? '') })
+    },
+  }), 'dsh-ruliu: 如流回调路由')
+
+  // ---- 出站：把 assistant 文本发回如流 ----
+  ctx.effect(() => ctx.on('session/event', (session, event) => {
+    const chatId = sessions.chatOf(session?.id)
+    if (chatId === undefined) return
+    // 本轮相关事件全记：排障时能看出「回合有没有真的跑起来、为什么结束」
+    if (event?.type === 'turn/end') {
+      const reason = event.data?.reason
+      log('turn-end', {
+        chatId,
+        kind: reason?.kind ?? '(none)',
+        error: describeError(reason?.error),
+        reasonRaw: (() => { try { return JSON.stringify(reason).slice(0, 300) } catch { return '(unserializable)' } })(),
+      })
+    } else if (event?.type !== 'assistant/message') {
+      log('session-event', { chatId, type: event?.type })
+    }
+    if (event?.type !== 'assistant/message') return
+    const text = textOfAssistantMessage(event.data?.message)
+    if (text === '') return
+    log('outbound-attempt', { chatId, chars: text.length })
+    void client.sendText(chatId, text, lastInboundId.get(chatId))
+      .then(() => log('outbound-sent', { chatId }))
+      .catch((error) => {
+        log('outbound-failed', { chatId, error: String(error?.message ?? error) })
+        logger?.warn?.('dsh-ruliu: 出站发送失败：%s', String(error?.message ?? error))
+      })
+  }), 'dsh-ruliu: assistant 出站')
+
+  // 插件卸载时释放 preset scope（与 acquirePresetScope 配对）
+  ctx.effect(() => () => {
+    for (const scope of presetScopes.values()) {
+      try { scope?.[Symbol.asyncDispose]?.() } catch { /* best effort */ }
+    }
+    presetScopes.clear()
+  }, 'dsh-ruliu: preset scope cleanup')
+
+  log('mounted', { webhookPath, stateDir, apiHost: config.apiHost ?? '(default)', cwd })
+
+  logger?.info?.('dsh-ruliu: 已挂载，回调 %s，状态目录 %s', webhookPath, stateDir)
+}

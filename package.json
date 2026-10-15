@@ -1,0 +1,13 @@
+{
+  "name": "dsh-ruliu",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "百度如流（InfoFlow）↔ DeepSeek Harness 通道插件：如流里发消息驱动 DSH 会话，DSH 的回复回推到如流。",
+  "exports": "./index.mjs",
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

@@ -1,0 +1,16 @@
+# dsh-ruliu bundle patch：把如流通道行插进 profile 组合。
+#
+# 这里只给"关着"的默认值；真正的配置请在 profile 的 cordis.patch.yml 里
+# 覆盖同一 id 的行（见 README「配置」一节），例如：
+#
+#   - id: dsh-ruliu
+#     config:
+#       enabled: true
+#       ...
+#
+# 覆盖行会整块替换下面的 config，所以覆盖时要把用到的字段都写上。
+- insert:
+    - id: dsh-ruliu
+      name: 'dsh-ruliu'
+      config:
+        enabled: false
