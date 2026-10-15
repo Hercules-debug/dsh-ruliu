@@ -1,0 +1,15 @@
+# 复制到：$DSH_HOME/profiles/web/cordis.patch.yml
+# 再把下面尖括号里的值替换成你自己的真实配置。
+# 不要把填好真实值的文件提交到 GitHub。
+- id: dsh-ruliu
+  config:
+    enabled: true
+    appKey: '<这里填如流开放平台的 AppKey>'
+    appSecret: '<这里填如流开放平台的 AppSecret>'
+    agentId: 123456                 # 机器人 Agent ID，只填数字
+    checkToken: '<这里填回调校验 Token>'
+    encodingAESKey: '<这里填消息加密 AES Key，通常是 22 位>'
+    apiHost: 'https://api.im.baidu.com' # 百度内网可改为 http://apiin.im.baidu.com
+    webhookPath: '/dsh-ruliu/webhook'
+    cwd: '/path/to/your/workspace'      # 改成 DSH 实际工作目录
+    msgType: 'text'                     # text | md

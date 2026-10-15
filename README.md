@@ -17,39 +17,68 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 ## 配置
 
-往 `$DSH_HOME/profiles/web/cordis.patch.yml` 追加（覆盖行会整块替换 bundle 里的默认 config，所以字段要写全）：
+插件安装后，**真正需要填写配置的是 DSH profile 文件**，不是仓库里的 `cordis.patch.yml`。先复制仓库里的模板：
+
+```sh
+cp examples/cordis.patch.yml \
+  "$DSH_HOME/profiles/web/cordis.patch.yml"
+```
+
+如果目标文件已经存在，就把 `examples/cordis.patch.yml` 里的 `- id: dsh-ruliu` 整段追加或合并进去。然后打开：
+
+```text
+$DSH_HOME/profiles/web/cordis.patch.yml
+```
+
+找到下面这段，把尖括号里的内容替换成你自己的值：
 
 ```yaml
 - id: dsh-ruliu
   config:
     enabled: true
-    appKey: '<应用 AppKey>'
-    appSecret: '<应用 AppSecret>'
-    agentId: <机器人 Agent ID，数字>
-    checkToken: '<回调验证 token>'
-    encodingAESKey: '<消息体 AES Key>'
-    apiHost: 'https://api.im.baidu.com'   # 内网可换 http://apiin.im.baidu.com
+    appKey: '<这里填如流开放平台的 AppKey>'
+    appSecret: '<这里填如流开放平台的 AppSecret>'
+    agentId: 123456                 # 这里填机器人 Agent ID，只填数字
+    checkToken: '<这里填回调校验 Token>'
+    encodingAESKey: '<这里填消息加密 AES Key，通常是 22 位>'
+    apiHost: 'https://api.im.baidu.com'
     webhookPath: '/dsh-ruliu/webhook'
-    cwd: '/path/to/your/workspace'           # 新会话的工作目录
-    msgType: 'text'                          # text | md
+    cwd: '/path/to/your/workspace'
+    msgType: 'text'
 ```
+
+必须填写的值一共有五项：
+
+| 配置项 | 填什么 | 从哪里获取 |
+|---|---|---|
+| `appKey` | 如流应用 AppKey | 如流开放平台的应用详情页 |
+| `appSecret` | 如流应用 AppSecret | 同一个应用详情页；插件会自动计算接口所需的 md5，不要手动加密 |
+| `agentId` | 机器人 Agent ID | 如流开放平台的机器人/应用详情页，必须是数字 |
+| `checkToken` | 回调校验 Token | 如流开放平台「接收消息服务器」配置页；自己生成并填入两边也可以 |
+| `encodingAESKey` | 消息加密 AES Key | 如流开放平台「接收消息服务器」配置页；通常是 22 位字符串 |
+
+`agentId` 是机器人 ID；`appKey` 和 `appSecret` 是应用凭证；`checkToken` 和 `encodingAESKey` 是 webhook 校验与消息解密用的 key。它们不是本项目生成的值，也不要把真实值提交到 GitHub。
 
 | 字段 | 必需 | 说明 |
 |---|---|---|
-| `appKey` / `appSecret` | ✅ | 开放平台应用详情页；token 请求里 `app_secret` 传 md5 hex（插件自己算） |
-| `agentId` | 发消息必需 | 机器人 Agent ID，写进出站 body |
-| `checkToken` | ✅（webhook） | 控制台「接收消息服务器」里的回调验证 token |
-| `encodingAESKey` | ✅（webhook） | 同上；消息体 AES-ECB 的 key（原始 22 位） |
-| `apiHost` | 可选 | 默认 `https://api.im.baidu.com`；内网走 `http://apiin.im.baidu.com` |
+| `apiHost` | 可选 | 默认 `https://api.im.baidu.com`；百度内网机器通常使用 `http://apiin.im.baidu.com` |
 | `webhookPath` | 可选 | 默认 `/dsh-ruliu/webhook`，要和如流后台填的一致 |
-| `cwd` | 可选 | 新建 DSH 会话的工作目录，默认宿主进程 cwd |
+| `cwd` | 可选 | 新建 DSH 会话的工作目录，改成 DSH 实际运行的目录 |
 | `msgType` | 可选 | 出站消息类型，`text`（默认）或 `md` |
 
-**如流后台**：把「接收消息服务器」的回调地址填成
+**机器地址也要填**：在如流后台「接收消息服务器」里，把回调 URL 填成下面的形式，把 `<机器内网IP>` 换成运行 DSH 的机器 IP：
 
+```text
+http://<机器内网IP>:8080/dsh-ruliu/webhook
 ```
-http://<这台机器的内网IP>:8080/dsh-ruliu/webhook
+
+例如 DSH 机器内网 IP 是 `10.10.20.35`，就填：
+
+```text
+http://10.10.20.35:8080/dsh-ruliu/webhook
 ```
+
+这里的机器 IP 必须是如流服务器能访问到的地址，不能填 `127.0.0.1` 或 `localhost`。如果 DSH 不是监听 8080 端口，还要把 URL 中的端口改成实际端口。
 
 如流会先发一次 `echostr` 校验（插件按 `md5(rn + timestamp + checkToken)` 验签并原样回显），通过后才开始推消息。
 
