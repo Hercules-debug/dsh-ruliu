@@ -1,13 +1,26 @@
 {
   "name": "dsh-ruliu",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
-  "description": "百度如流（InfoFlow）↔ DeepSeek Harness 通道插件：如流里发消息驱动 DSH 会话，DSH 的回复回推到如流。",
-  "exports": "./index.mjs",
+  "description": "百度如流（InfoFlow）↔ DeepSeek Harness 通道插件，支持设置页面配置。",
+  "exports": {
+    ".": "./index.mjs",
+    "./client": "./lib/client.js",
+    "./package.json": "./package.json"
+  },
   "dsh": {
-    "bundle": {
-      "patch": "./cordis.patch.yml"
+    "bundle": { "patch": "./cordis.patch.yml" },
+    "client": {
+      "platform": "web",
+      "inject": ["@deepseek-ai/dsh-client-ui-settings", "@deepseek-ai/dsh-api-remotes"],
+      "external": ["react", "@deepseek-ai/dsh-client-ui-primitives"]
     }
-  }
+  },
+  "dependencies": { "@deepseek-ai/schemastery": "~3.18.4" },
+  "scripts": {
+    "build": "node scripts/build-client.mjs",
+    "test": "node --test test/config.test.mjs test/transport-lifecycle.test.mjs test/settings-client.test.mjs && node test/protocol.test.mjs"
+  },
+  "engines": { "node": ">=22" }
 }

@@ -29,6 +29,9 @@ import { appendFileSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createRuliuClient } from './lib/ruliu.mjs'
+import { Config, validateConfiguration } from './lib/config.mjs'
+
+export { Config }
 
 /** 稳定的 Cordis 插件名。 */
 export const name = 'dsh-ruliu'
@@ -269,12 +272,27 @@ class SessionMap {
   }
 }
 
-/**
- * 注册如流通道。
- * @param ctx - 携带 webServer / agents / sessions 的插件上下文。
- * @param config - profile 组合里的行配置（本插件不声明 Config schema，字段即约定）。
- */
-export function apply(ctx, config = {}) {
+/** Keep settings available even while the channel is disabled or awaiting credentials. */
+export function apply(ctx, config) {
+  ctx.inject(['settings'], (child) => {
+    child.effect(() => child.settings.configure({ auto: false }, ctx.fiber))
+  })
+  // Validate settings writes without logging or echoing their values.
+  ctx.on('internal/config', function (_raw, next) {
+    const raw = next()
+    if (this === ctx.fiber) validateConfiguration(Config(raw).get())
+    return raw
+  })
+  const snapshot = typeof config?.get === 'function' ? config.get() : config ?? {}
+  mountTransport(ctx, snapshot)
+  // A volatile form update changes the references in place. Restarting this
+  // small bridge swaps the route and event subscription exactly once, while
+  // preserving the rest of the DSH host and the persisted chat mapping.
+  ctx.on('loader/volatile-update', () => { void ctx.fiber.restart().catch((error) => ctx.logger.warn(error)) })
+}
+
+/** Transport owns routes, session subscriptions and client tokens for one config snapshot. */
+function mountTransport(ctx, config = {}) {
   const logger = ctx.logger
 
   if (config.enabled !== true) {

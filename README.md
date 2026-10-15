@@ -17,11 +17,13 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 ## 配置
 
-插件安装后，**在 DSH profile 中填写机器人 ID 和凭证**。当前版本通过配置文件填写，尚未提供图形设置表单。
+安装并重新加载 DSH 后，在 Web UI 的 **设置 → 如流** 中填写机器人 ID 和凭证，使用方式和填写 API Key 类似。页面里的四项密钥是密码输入框，只显示“已配置”，不会回显原文；保存时留空表示保留已有密钥。
 
-打开 `${DSH_HOME:-$HOME/.dsh}/profiles/web/cordis.patch.yml`（未设置 `DSH_HOME` 时通常是 `~/.dsh/profiles/web/cordis.patch.yml`）。把 [配置模板](examples/cordis.patch.yml) 中的 `- id: dsh-ruliu` 整段合并进去；如果已经有相同 id，直接修改那一段，保留其他插件的配置。
+设置页提供以下字段：机器人 Agent ID、AppKey、AppSecret、回调校验 Token、消息加密 AES Key，以及接口地址、回调路径、工作目录和消息类型。页面还会根据当前 DSH 地址生成可复制的回调 URL。
 
-仓库根目录的 `cordis.patch.yml` 用于注册插件，个人凭证填写在上述 profile 文件中。
+如果当前 DSH 是已经运行的旧版本，安装新版本后需要让插件重新加载一次；本地 link 开发环境还需要加载仓库里的 settings companion。正常从新版本安装时，客户端设置页面随插件一起加载。
+
+首次安装或无法使用图形设置页时，也可以把 [配置模板](examples/cordis.patch.yml) 合并到 `${DSH_HOME:-$HOME/.dsh}/profiles/web/cordis.patch.yml`，但个人凭证不要提交到 GitHub。
 
 找到下面这段，把尖括号里的内容替换成你自己的值：
 
