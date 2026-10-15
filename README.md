@@ -17,18 +17,11 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 ## 配置
 
-插件安装后，**真正需要填写配置的是 DSH profile 文件**，不是仓库里的 `cordis.patch.yml`。先复制仓库里的模板：
+插件安装后，**在 DSH profile 中填写机器人 ID 和凭证**。当前版本通过配置文件填写，尚未提供图形设置表单。
 
-```sh
-cp examples/cordis.patch.yml \
-  "$DSH_HOME/profiles/web/cordis.patch.yml"
-```
+打开 `${DSH_HOME:-$HOME/.dsh}/profiles/web/cordis.patch.yml`（未设置 `DSH_HOME` 时通常是 `~/.dsh/profiles/web/cordis.patch.yml`）。把 [配置模板](examples/cordis.patch.yml) 中的 `- id: dsh-ruliu` 整段合并进去；如果已经有相同 id，直接修改那一段，保留其他插件的配置。
 
-如果目标文件已经存在，就把 `examples/cordis.patch.yml` 里的 `- id: dsh-ruliu` 整段追加或合并进去。然后打开：
-
-```text
-$DSH_HOME/profiles/web/cordis.patch.yml
-```
+仓库根目录的 `cordis.patch.yml` 用于注册插件，个人凭证填写在上述 profile 文件中。
 
 找到下面这段，把尖括号里的内容替换成你自己的值：
 
