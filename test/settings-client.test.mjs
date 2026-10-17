@@ -29,6 +29,15 @@ test('blank secrets are omitted while changed secrets are write-only mutations',
   ])
 })
 
+test('clearing the optional robot id unsets it instead of writing an empty value', () => {
+  const base = { value: { enabled: true, agentId: 7 } }
+  assert.deepEqual(JSON.parse(JSON.stringify(client.buildMutation(base, { agentId: '  ' }))), [
+    { op: 'unset', path: ['agentId'] },
+  ])
+  // 本来就没有值时不重复 unset
+  assert.deepEqual(JSON.parse(JSON.stringify(client.buildMutation({ value: { enabled: true } }, { agentId: '' }))), [])
+})
+
 test('callback URL uses the configured route and rejects unsafe routes', () => {
   assert.equal(client.callbackURL('http://10.0.0.2:8080', '/dsh-ruliu/webhook'), 'http://10.0.0.2:8080/dsh-ruliu/webhook')
   assert.equal(client.callbackURL('http://10.0.0.2:8080', '//other.example'), '')

@@ -280,7 +280,7 @@ function RuliuSettingsSection({ controller }) {
       onSave: () => controller.save(), onDiscard: () => controller.discard(),
     },
     h(Checkbox, { checked: Boolean(displayed('enabled')), disabled, label: '启用如流机器人', onChange: (checked) => controller.edit('enabled', checked) }),
-    valueField('agentId', '机器人 ID（Agent ID）', '来源：如流开放平台的机器人 / 应用详情页；填数字，可留空。', { numeric: true }),
+    valueField('agentId', '机器人 ID（Agent ID）', '来源：如流开放平台的机器人 / 应用详情页；可留空 —— 留空时发消息不带 agentid。', { numeric: true }),
     ...SECRETS.map((key) => h(SettingsSecretField, {
       key, id: `ruliu-${key}`, label: secretCopy[key][0],
       hint: `${secretCopy[key][1]} 留空保留当前值，输入新值后保存以替换。`,

@@ -17,9 +17,9 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 ## 配置
 
-安装并重新加载 DSH 后，在 Web UI 的 **设置 → 如流** 中填写机器人 ID 和凭证，使用方式和填写 API Key 类似。页面里的四项密钥是密码输入框，只显示“已配置”，不会回显原文；保存时留空表示保留已有密钥。
+安装并重新加载 DSH 后，在 Web UI 的 **设置 → 如流** 中填写应用凭证与回调密钥，使用方式和填写 API Key 类似。页面里的四项密钥是密码输入框，只显示“已配置”，不会回显原文；保存时留空表示保留已有密钥。
 
-设置页提供以下字段：机器人 Agent ID、AppKey、AppSecret、回调校验 Token、消息加密 AES Key，以及接口地址、回调路径、工作目录和消息类型。页面还会根据当前 DSH 地址生成可复制的回调 URL。
+设置页提供以下字段：AppKey、AppSecret、回调校验 Token、消息加密 AES Key（这四项必填），机器人 Agent ID（可选），以及接口地址、回调路径、工作目录和消息类型。页面还会根据当前 DSH 地址生成可复制的回调 URL。
 
 如果当前 DSH 是已经运行的旧版本，安装新版本后需要让插件重新加载一次；本地 link 开发环境还需要加载仓库里的 settings companion。正常从新版本安装时，客户端设置页面随插件一起加载。
 
@@ -33,7 +33,7 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
     enabled: true
     appKey: '<这里填如流开放平台的 AppKey>'
     appSecret: '<这里填如流开放平台的 AppSecret>'
-    agentId: 123456                 # 这里填机器人 Agent ID，只填数字
+    agentId: 123456                 # 机器人 Agent ID，只填数字；不需要可以留空
     checkToken: '<这里填回调校验 Token>'
     encodingAESKey: '<这里填消息加密 AES Key，通常是 22 位>'
     apiHost: 'https://api.im.baidu.com'
@@ -42,17 +42,21 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
     msgType: 'text'
 ```
 
-必须填写的值一共有五项：
+必须填写的值一共有四项：
 
 | 配置项 | 填什么 | 从哪里获取 |
 |---|---|---|
 | `appKey` | 如流应用 AppKey | 如流开放平台的应用详情页 |
 | `appSecret` | 如流应用 AppSecret | 同一个应用详情页；插件会自动计算接口所需的 md5，不要手动加密 |
-| `agentId` | 机器人 Agent ID | 如流开放平台的机器人/应用详情页，必须是数字 |
 | `checkToken` | 回调校验 Token | 如流开放平台「接收消息服务器」配置页；自己生成并填入两边也可以 |
 | `encodingAESKey` | 消息加密 AES Key | 如流开放平台「接收消息服务器」配置页；通常是 22 位字符串 |
 
-`agentId` 是机器人 ID；`appKey` 和 `appSecret` 是应用凭证；`checkToken` 和 `encodingAESKey` 是 webhook 校验与消息解密用的 key。它们不是本项目生成的值，也不要把真实值提交到 GitHub。
+`agentId`（机器人 ID）**可选**：留空时发消息不带 `agentid` 字段，只影响部分需要它的接口。
+
+`appKey` 和 `appSecret` 是如流**发给你的**应用凭证（用来换 `app_access_token` 发消息）；
+`checkToken` 和 `encodingAESKey` 不是平台发给你的值，而是**回调模式下的双方约定值** ——
+如流推送事件时会用它们签名、加密，所以必须在如流后台和本插件里填成一样的，
+没法从 AppKey/AppSecret 推导出来。它们也不是本项目生成的值，不要把真实值提交到 GitHub。
 
 | 字段 | 必需 | 说明 |
 |---|---|---|

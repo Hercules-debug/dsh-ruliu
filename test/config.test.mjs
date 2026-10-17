@@ -24,12 +24,18 @@ test('existing profile configuration remains compatible', () => {
   assert.equal(config.stateDir, '/state')
 })
 
-test('enabled channel rejects missing credentials and invalid robot ids', () => {
+test('enabled channel rejects missing credentials but accepts an omitted robot id', () => {
   for (const field of ['appKey', 'appSecret', 'checkToken', 'encodingAESKey']) {
     const config = Config({ ...valid, [field]: '' }).get()
     assert.throws(() => validateConfiguration(config), /启用如流前/)
   }
-  assert.throws(() => validateConfiguration(Config({ ...valid, agentId: undefined }).get()), /Agent ID/)
+  // 机器人 ID 可选：留空（unset）时照常启用，发送路径不带 agentid
+  const withoutAgent = Config({ ...valid, agentId: undefined }).get()
+  assert.equal(withoutAgent.agentId, undefined)
+  validateConfiguration(withoutAgent)
+  // 填了就必须是正整数（schema 先卡一道，validateConfiguration 是最后一道防线）
+  const full = { ...valid, apiHost: 'https://api.im.baidu.com', webhookPath: '/dsh-ruliu/webhook' }
+  assert.throws(() => validateConfiguration({ ...full, agentId: 0 }), /Agent ID/)
   for (const agentId of [-1, 0, 1.5, Number.MAX_SAFE_INTEGER + 1]) assert.throws(() => Config({ ...valid, agentId }))
 })
 
