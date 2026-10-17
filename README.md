@@ -36,6 +36,12 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 如果当前 DSH 是已经运行的旧版本，安装新版本后需要让插件重新加载一次；本地 link 开发环境还需要加载仓库里的 settings companion。正常从新版本安装时，客户端设置页面随插件一起加载。
 
+> **两份客户端产物必须同源**：`lib/client.js`（`package.json` 的 `./client`）和
+> `ui/lib/client.js`（link 环境下按 `ui/index.mjs` 单独挂的 companion）都由
+> `client/settings.cjs` 生成，`npm run build` 会同时写两份，测试里也断言两者字节一致。
+> 只更新其中一份会出现「宿主发的是新版、页面渲染的是旧版」—— 改设置页却看不到效果，
+> 实测踩过一次。
+
 首次安装或无法使用图形设置页时，也可以把 [配置模板](examples/cordis.patch.yml) 合并到 `${DSH_HOME:-$HOME/.dsh}/profiles/web/cordis.patch.yml`，但个人凭证不要提交到 GitHub。
 
 找到下面这段，把尖括号里的内容替换成你自己的值：
