@@ -7,6 +7,10 @@ const {
 const h = React.createElement
 const NS = 'dsh-ruliu'
 const SECRETS = ['appKey', 'appSecret', 'checkToken', 'encodingAESKey']
+/** 必填：如流只发这两样（应用凭证）。 */
+const REQUIRED_SECRETS = ['appKey', 'appSecret']
+/** 可选：留空时由插件生成并调 updateReCallUrl 注册到如流（见 lib/callback.mjs）。 */
+const ADVANCED_SECRETS = SECRETS.filter((key) => !REQUIRED_SECRETS.includes(key))
 const VALUES = ['enabled', 'agentId', 'apiHost', 'webhookPath', 'publicCallbackUrl', 'cwd', 'msgType']
 const DEFAULTS = Object.freeze({
   enabled: false, apiHost: 'https://api.im.baidu.com',
@@ -268,6 +272,13 @@ function RuliuSettingsSection({ controller }) {
     invalidLabel: state.invalid, onEdit: (text) => controller.edit(key, text), ...extra,
   })
   const configured = (key) => state.latest?.secrets?.some((entry) => entry.path.length === 1 && entry.path[0] === key && entry.set) === true
+  const secretField = (key) => h(SettingsSecretField, {
+    key, id: `ruliu-${key}`, label: secretCopy[key][0],
+    hint: `${secretCopy[key][1]} 留空保留当前值，输入新值后保存以替换。`,
+    disabled, text: state.draft[key] || '', configured: configured(key),
+    stateLabel: configured(key) ? '已配置（Host）' : '未配置',
+    onEdit: (text) => controller.edit(key, text),
+  })
   const copy = async () => {
     try {
       if (!globalThis.navigator?.clipboard?.writeText) throw new Error('当前浏览器未开放剪贴板，请选中地址手动复制。')
@@ -296,7 +307,7 @@ function RuliuSettingsSection({ controller }) {
   }
   return h('section', { style: layout, 'aria-label': '如流设置' },
     h('h2', { style: { margin: 0, fontSize: 18, fontWeight: 500 } }, '如流'),
-    h('p', { style: hintStyle }, '填 AppKey 与 AppSecret 就能用：Token 和 AESKey 留空时由插件自动生成，并调如流接口注册回调地址。'),
+    h('p', { style: hintStyle }, '只需要 AppKey 与 AppSecret 两项；回调用的 Token、AESKey 和回调地址由插件自动生成并注册到如流，其余都在「高级设置」里。'),
     state.loading && h('p', { role: 'status', style: hintStyle }, '正在加载如流设置…'),
     state.error && h('p', { role: 'alert', style: { ...hintStyle, color: 'var(--dsw-alias-state-error-primary)' } }, state.error),
     state.success && h('p', { role: 'status', style: { ...hintStyle, color: 'var(--dsw-alias-state-success-primary)' } }, '如流设置已保存。'),
@@ -313,38 +324,34 @@ function RuliuSettingsSection({ controller }) {
       onSave: () => controller.save(), onDiscard: () => controller.discard(),
     },
     h(Checkbox, { checked: Boolean(displayed('enabled')), disabled, label: '启用如流机器人', onChange: (checked) => controller.edit('enabled', checked) }),
-    valueField('agentId', '机器人 ID（Agent ID）', '来源：如流开放平台的机器人 / 应用详情页；可留空 —— 留空时发消息不带 agentid。', { numeric: true }),
-    ...SECRETS.map((key) => h(SettingsSecretField, {
-      key, id: `ruliu-${key}`, label: secretCopy[key][0],
-      hint: `${secretCopy[key][1]} 留空保留当前值，输入新值后保存以替换。`,
-      disabled, text: state.draft[key] || '', configured: configured(key),
-      stateLabel: configured(key) ? '已配置（Host）' : '未配置',
-      onEdit: (text) => controller.edit(key, text),
-    })),
-    (!configured('appKey') || !configured('appSecret')) && h('p', { role: 'status', style: hintStyle }, '启用前至少要填 AppKey 和 AppSecret；Token 与 AESKey 留空时由插件自动生成并注册到如流。'),
+    ...REQUIRED_SECRETS.map(secretField),
+    (!configured('appKey') || !configured('appSecret')) && h('p', { role: 'status', style: hintStyle }, '启用前填 AppKey 和 AppSecret 就行；Token、AESKey、回调地址由插件自动生成并注册到如流。'),
     h('details', null,
-      h('summary', { style: { cursor: 'pointer', marginBottom: 12 } }, '高级设置'),
+      h('summary', { style: { cursor: 'pointer', marginBottom: 12 } }, '高级设置（可选）'),
       h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
+        valueField('agentId', '机器人 ID（Agent ID）', '来源：如流开放平台的机器人 / 应用详情页；可留空 —— 留空时发消息不带 agentid。', { numeric: true }),
+        ...ADVANCED_SECRETS.map(secretField),
         valueField('apiHost', 'API 地址', '默认 https://api.im.baidu.com；可填写当前部署使用的如流 API 地址。'),
         valueField('webhookPath', '回调路径', '默认 /dsh-ruliu/webhook；保存后须与如流后台回调地址一致。'),
         valueField('publicCallbackUrl', '对外回调地址', '如流服务器能访问到的完整地址（例如 http://10.206.116.22:8080/dsh-ruliu/webhook）；留空则按浏览器地址 / 本机内网地址自动推导。'),
         valueField('cwd', '会话工作目录', '填写 DSH Host 上的工作目录；留空使用 Host 默认目录。'),
         valueField('msgType', '消息类型', '填写 text（纯文本）或 md（Markdown）；默认 text。'),
-      )),
-    state.invalid && h('p', { role: 'alert', style: hintStyle }, state.invalid),
-    h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
-      h('label', { htmlFor: 'ruliu-callback-url' }, '回调 URL'),
-      h('input', { id: 'ruliu-callback-url', readOnly: true, value: url, 'aria-label': '回调 URL', onFocus: (event) => event.target.select(), style: { width: '100%', boxSizing: 'border-box', color: 'inherit', background: 'var(--dsw-alias-settings-card-fill)', border: '1px solid var(--dsw-alias-border-l3)', borderRadius: 8, padding: 10 } }),
-      h('div', { style: { display: 'flex', gap: 8 } },
-        h(Button, { type: 'button', variant: 'secondary', disabled: !url, onClick: copy }, '复制回调 URL'),
-        h(Button, { type: 'button', variant: 'secondary', disabled: disabled || registering || state.dirty || !configured('appKey'), onClick: register }, registering ? '注册中…' : '注册回调到如流')),
-      h('p', { style: hintStyle }, state.dirty
-        ? '有未保存的修改：先保存，再点「注册回调到如流」。'
-        : '「注册回调到如流」会用已保存的 AppKey/AppSecret 取 token，把上面的回调地址和 Token/AESKey 一起写到如流机器人后台（等价官方 SDK 的 starter.register）。地址必须能被如流服务器访问到，本机 localhost / 127.0.0.1 不行。'),
-      copyState && h('p', { role: 'status', style: hintStyle }, copyState),
-      registerState && h('p', { role: 'status', style: hintStyle }, registerState),
-    )),
-  )
+        state.invalid && h('p', { role: 'alert', style: hintStyle }, state.invalid),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
+          h('label', { htmlFor: 'ruliu-callback-url' }, '回调 URL'),
+          h('input', { id: 'ruliu-callback-url', readOnly: true, value: url, 'aria-label': '回调 URL', onFocus: (event) => event.target.select(), style: { width: '100%', boxSizing: 'border-box', color: 'inherit', background: 'var(--dsw-alias-settings-card-fill)', border: '1px solid var(--dsw-alias-border-l3)', borderRadius: 8, padding: 10 } }),
+          h('div', { style: { display: 'flex', gap: 8 } },
+            h(Button, { type: 'button', variant: 'secondary', disabled: !url, onClick: copy }, '复制回调 URL'),
+            h(Button, { type: 'button', variant: 'secondary', disabled: disabled || registering || state.dirty || !configured('appKey'), onClick: register }, registering ? '注册中…' : '注册回调到如流')),
+          h('p', { style: hintStyle }, state.dirty
+            ? '有未保存的修改：先保存，再点「注册回调到如流」。'
+            : '首次配置（Token/AESKey 留空）时插件挂载后会自动注册一次；改了 Token、回调路径或换了机器之后，点这个按钮重新注册。地址必须能被如流服务器访问到，本机 localhost / 127.0.0.1 不行。'),
+          copyState && h('p', { role: 'status', style: hintStyle }, copyState),
+          registerState && h('p', { role: 'status', style: hintStyle }, registerState),
+        )),   // 关掉回调块 div 与「高级设置」内容 div
+      ),      // 关掉 details
+    ),        // 关掉 SettingsForm（下面的字段都是它的 children）
+  )           // 关掉 section
 }
 
 const inject = ['slots', 'configForms', 'remote', 'remote.settings']
