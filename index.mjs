@@ -486,21 +486,55 @@ function mountTransport(ctx, config = {}) {
   const activityAt = new Map()
 
   /** 命令帮助文本。 */
-  const helpText = () => [
-    '📖 **可用命令**',
-    '',
-    '`/new [提示词]` — 开一个新会话（可带首条提示词）',
-    '`/list` — 列出最近的会话（别名 `/sessions`）',
-    '`/use <序号>` — 把本聊天切到 `/list` 里的某个会话',
-    '`/1` `/2` … — 回答审批或模型提问（有等待项时；多问题按顺序 `/1 2`，多选 `/1,3`）',
-    '`/permission [预设]` — 查看 / 切换当前会话的权限预设（如流里可直接用）',
-    '`/compact` — 压缩当前会话的上下文（如流里可直接用）',
-    '`/end` — 结束当前绑定，下条消息会开新会话',
-    '`/status` — 看当前绑定的会话与模型',
-    '`/help` — 显示这条帮助',
-    '',
-    '直接发普通文字就是和当前会话对话。',
-  ].join('\n')
+  /**
+   * 权限预设的展示文案：`名字（审批口径）`，用 `/` 连接。
+   *
+   * 名字和口径都从 `permissionPresets` 服务读，不写死 —— 预设表可被 profile 覆盖，
+   * `auto` 档还要看有没有插件注册（`registerAuto`）。服务不可用时返回空串，
+   * 帮助里就退回不列预设的写法。
+   * @returns 一行文案，或空串。
+   */
+  const permissionPresetHelp = () => {
+    try {
+      const presets = ctx.get?.('permissionPresets')
+      const names = presets?.names
+      if (!Array.isArray(names) || names.length === 0) return ''
+      return names.map((name) => {
+        let approval = ''
+        try {
+          approval = presets.resolve?.(name)?.approval === 'never' ? '不问审批' : '需要时问审批'
+        } catch {
+          approval = ''
+        }
+        return approval === '' ? String(name) : `${String(name)}（${approval}）`
+      }).join(' / ')
+    } catch {
+      return ''
+    }
+  }
+
+  /** 命令帮助文本；权限预设那两行按当前部署实际可用的预设生成。 */
+  const helpText = () => {
+    const presets = permissionPresetHelp()
+    return [
+      '📖 **可用命令**',
+      '',
+      '`/new [提示词]` — 开一个新会话（可带首条提示词）',
+      '`/list` — 列出最近的会话（别名 `/sessions`）',
+      '`/use <序号>` — 把本聊天切到 `/list` 里的某个会话',
+      '`/1` `/2` … — 回答审批或模型提问（有等待项时；多问题按顺序 `/1 2`，多选 `/1,3`）',
+      presets === ''
+        ? '`/permission` — 查看当前会话的权限预设'
+        : `\`/permission\` — 查看当前权限预设；可切：${presets}`,
+      '`/permission <预设>` — 切换权限：沙箱模式 + 审批策略一起换',
+      '`/compact` — 压缩当前会话的上下文',
+      '`/end` — 结束当前绑定，下条消息会开新会话',
+      '`/status` — 看当前绑定的会话与模型',
+      '`/help` — 显示这条帮助',
+      '',
+      '直接发普通文字就是和当前会话对话。',
+    ].join('\n')
+  }
 
   /**
    * 给还没有标题的行补上 DSH 的会话标题（`session/title` 事件的折叠结果）。
@@ -707,7 +741,10 @@ function mountTransport(ctx, config = {}) {
     const arg = spaceAt === -1 ? '' : input.slice(spaceAt).trim()
 
     if (cmd === '/help' || cmd === '/?') {
-      await client.sendText(chatId, helpText())
+      const text = helpText()
+      // 命令类回复在日志里看不到内容，排障时靠这行还原
+      log('command-help', { chatId, preview: text.slice(0, 400) })
+      await client.sendText(chatId, text)
       return { handled: true }
     }
 
