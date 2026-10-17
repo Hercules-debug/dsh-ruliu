@@ -474,21 +474,49 @@ function mountTransport(ctx, config = {}) {
   }
 
   /**
-   * 把会话列表渲染成 IM 文本：只留序号 + 标题。
+   * 取「当前绑定会话」的标题，仅在它不在 rows 里时用。
+   *
+   * 用途：绑定的会话可能已经掉出最近 10 条，这时 `/list` 要能补一句
+   * 「当前绑定的是哪条」，否则用户会以为自己的会话凭空消失了。
+   * @param bound - 绑定的会话 id，或 undefined。
+   * @param rows - listSessions 的结果。
+   * @returns {Promise<string>} 标题；不需要补时返回空串。
+   */
+  const titleOfMissing = async (bound, rows) => {
+    if (bound === undefined || rows.some((row) => row.id === bound)) return ''
+    const probe = [{ id: bound, title: '' }]
+    await fillTitles(probe)
+    return probe[0]?.title ?? ''
+  }
+
+  /**
+   * 把会话列表渲染成 IM 文本：序号 + 标题，并标出本聊天当前绑定的那条。
    *
    * 故意不打印 `session-<uuid>`：那是 DSH 的内部实现细节，IM 里的使用者既读不出
    * 信息量也用不上 —— 切换靠的是序号（`/use <序号>`），id 只在日志里出现。
    * 也故意不打印创建时间和「🟢 活跃」：IM 是窄屏，这两项把标题挤到换行，
    * 而「活跃」本来就是排序依据（活跃的排在最前），标出来是冗余信息。
+   *
+   * 但「当前绑定的是哪条」必须标：如流这边一个聊天只绑一条会话，而列表是全工作区的
+   * 会话，两者不是一回事 —— 不标的话，「我刚用过的会话」和「如流现在实际在用的会话」
+   * 会被当成同一个，看列表就会觉得「我们的会话怎么没排在最上面」。
    * @param rows - listSessions 的结果。
+   * @param bound - 本聊天当前绑定的会话 id，或 undefined（未绑定）。
+   * @param boundTitle - 绑定会话的标题，仅在它不在 rows 里时用于提示。
    * @returns 文本。
    */
-  const renderSessions = (rows) => {
+  const renderSessions = (rows, bound, boundTitle = '') => {
     if (rows.length === 0) return '还没有任何会话。发送 `/new <提示词>` 开一个。'
     const lines = ['🗂 **最近的会话**（用 `/use <序号>` 切换）', '']
+    let marked = false
     rows.forEach((row, index) => {
-      lines.push(`${index + 1}. ${row.title === '' ? '(未命名)' : row.title}`)
+      const current = bound !== undefined && row.id === bound
+      if (current) marked = true
+      lines.push(`${index + 1}. ${row.title === '' ? '(未命名)' : row.title}${current ? ' ← 当前' : ''}`)
     })
+    if (bound !== undefined && !marked) {
+      lines.push('', `（当前绑定的是「${boundTitle === '' ? '(未命名)' : boundTitle}」，不在上面这些里）`)
+    }
     return lines.join('\n')
   }
 
@@ -538,9 +566,10 @@ function mountTransport(ctx, config = {}) {
 
     if (cmd === '/list' || cmd === '/sessions') {
       lastListing = await listSessions()
-      const rendered = renderSessions(lastListing)
+      const bound = sessions.sessionOf(chatId)
+      const rendered = renderSessions(lastListing, bound, await titleOfMissing(bound, lastListing))
       // 记一份渲染结果：IM 里发出去的内容在日志里看不到，排障时只能靠这行还原
-      log('command-list', { chatId, count: lastListing.length, preview: rendered.slice(0, 300) })
+      log('command-list', { chatId, count: lastListing.length, bound, preview: rendered.slice(0, 300) })
       await client.sendText(chatId, rendered)
       return { handled: true }
     }
@@ -550,7 +579,9 @@ function mountTransport(ctx, config = {}) {
       const picked = Number.isInteger(index) ? lastListing[index - 1] : undefined
       if (picked === undefined) {
         lastListing = await listSessions()
-        await client.sendText(chatId, `没找到序号「${arg}」。先看看列表：\n\n${renderSessions(lastListing)}`)
+        const bound = sessions.sessionOf(chatId)
+        const rendered = renderSessions(lastListing, bound, await titleOfMissing(bound, lastListing))
+        await client.sendText(chatId, `没找到序号「${arg}」。先看看列表：\n\n${rendered}`)
         return { handled: true }
       }
       sessions.bind(chatId, picked.id)
