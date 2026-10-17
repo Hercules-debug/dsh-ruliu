@@ -493,6 +493,8 @@ function mountTransport(ctx, config = {}) {
     '`/list` — 列出最近的会话（别名 `/sessions`）',
     '`/use <序号>` — 把本聊天切到 `/list` 里的某个会话',
     '`/1` `/2` … — 回答审批或模型提问（有等待项时；多问题按顺序 `/1 2`，多选 `/1,3`）',
+    '`/permission [预设]` — 查看 / 切换当前会话的权限预设（如流里可直接用）',
+    '`/compact` — 压缩当前会话的上下文（如流里可直接用）',
     '`/end` — 结束当前绑定，下条消息会开新会话',
     '`/status` — 看当前绑定的会话与模型',
     '`/help` — 显示这条帮助',
@@ -761,6 +763,35 @@ function mountTransport(ctx, config = {}) {
       return { handled: false, text: arg }
     }
 
+    // ---- DSH 内置命令桥（白名单）：`/permission`、`/compact` ----
+    //
+    // 命令解析本来在客户端（Web 页面）做，如流这边发 `/xxx` 只会被当普通消息丢给模型。
+    // 这里把两个常用命令接到宿主的 commands 服务：切权限、压上下文不用再开网页。
+    // 白名单之外一律不接，行为不变。
+    if (BRIDGED_COMMANDS.has(cmd.slice(1))) {
+      const bound = sessions.sessionOf(chatId)
+      const agent = bound === undefined ? undefined : ctx.agents.get(bound)
+      const commands = ctx.get?.('commands')
+      if (agent === undefined || typeof commands?.execute !== 'function' || commands.find?.(agent, cmd.slice(1)) === undefined) {
+        log('command-bridge-unavailable', { chatId, input: cmd, agent: agent !== undefined })
+        await client.sendText(chatId, `\`${cmd}\` 现在用不了：会话要先活跃起来（在如流发一条普通消息即可），并且当前部署要挂载这个命令。`)
+        return { handled: true }
+      }
+      try {
+        const execution = await commands.execute(agent, input, [], new AbortController().signal)
+        const result = execution?.result
+        const text = typeof result?.text === 'string' && result.text.trim() !== ''
+          ? result.text
+          : (result?.kind === 'error' ? `\`${cmd}\` 执行失败。` : `✅ \`${cmd}\` 已执行。`)
+        log('command-bridged', { chatId, input, kind: result?.kind ?? 'none' })
+        await client.sendText(chatId, text)
+      } catch (error) {
+        log('command-bridge-failed', { chatId, input, error: describeError(error) })
+        await client.sendText(chatId, `❌ \`${cmd}\` 执行失败：${String(error?.message ?? error)}`)
+      }
+      return { handled: true }
+    }
+
     // 未知命令：当普通消息交给模型（避免用户以为发出去的是命令）
     return { handled: false, text: input }
   }
@@ -977,6 +1008,9 @@ function mountTransport(ctx, config = {}) {
   //    抛 NO_PROVIDER）。那种结论不代表用户回答了，必须忽略掉继续等如流，否则 race
   //    会被它瞬间判负。
   //  - 如流这路赢了之后，Web 那边的卡片不会自动收掉（没有取消 API），它会自己超时/关闭。
+  /** 允许从如流触发的 DSH 内置命令（白名单；其它命令保持"当普通消息"的原行为）。 */
+  const BRIDGED_COMMANDS = new Set(['permission', 'compact'])
+
   /** chatId → 待答项：{ expectsText, resolve }。一次只有一个。 */
   const pendingAsks = new Map()
   /** 永不 settle：用来把"没有别的 answerer"这类结论从 race 里排除掉。 */
