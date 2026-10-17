@@ -695,6 +695,12 @@ function mountTransport(ctx, config = {}) {
         pendingAsk.resolve({ text: parsed.text })
         return { handled: true }
       }
+    } else if (/^\/(\d+(?:,\d+)*(?:\s+\d+(?:,\d+)*)*)$/u.test(input)) {
+      // 没有待答项却收到 `/1` 这种：多半是过期卡片（另一边已经答过，或者超时了）。
+      // 给一句提示，别把 "/1" 当正常消息丢给模型。
+      log('command-answer-stale', { chatId, input })
+      await client.sendText(chatId, '这一项已经在另一边答过了（或已超时），现在没有等待中的审批 / 选项。')
+      return { handled: true }
     }
 
     if (cmd === '/status') {
@@ -959,24 +965,32 @@ function mountTransport(ctx, config = {}) {
     },
   }), 'dsh-ruliu: 回调注册路由')
 
-  // ---- 审批桥 / 提问桥：把「等你回答」的东西推到如流，回 `/1` `/2` 结算 ----
+  // ---- 审批桥 / 提问桥：如流和 Web 页面**同时**弹，谁先答谁生效 ----
   //
-  // 用 prepend 抢在 Web 转发器前面：`approval/request` 和 `user-questions/request`
-  // 都是 waterfall，宿主会把它们转发给浏览器（dsh-api-remotes），而那个转发器比本插件
-  // 先注册 —— 不抢的话请求永远先落到 Web GUI，如流这边什么都看不到。
-  // 只接管「由如流驱动的会话」；其它会话一律 next() 交回 Web GUI。
+  // `approval/request` 和 `user-questions/request` 都是 waterfall，宿主会把它们转发给
+  // 浏览器（dsh-api-remotes），那个转发器比本插件先注册。所以这里用 prepend 站到链首，
+  // 但**不抢答**：发一条到如流之后照样调用 next() 让 Web 那路也弹卡片，然后 race 两路。
+  // 只有「由如流驱动的会话」才介入；其它会话直接 next()，行为完全不变。
+  //
+  // 两个细节：
+  //  - next() 在"没有别的 answerer"时会立刻给出结论（审批是 'unavailable'，提问是
+  //    抛 NO_PROVIDER）。那种结论不代表用户回答了，必须忽略掉继续等如流，否则 race
+  //    会被它瞬间判负。
+  //  - 如流这路赢了之后，Web 那边的卡片不会自动收掉（没有取消 API），它会自己超时/关闭。
   /** chatId → 待答项：{ expectsText, resolve }。一次只有一个。 */
   const pendingAsks = new Map()
+  /** 永不 settle：用来把"没有别的 answerer"这类结论从 race 里排除掉。 */
+  const NEVER = new Promise(() => {})
 
   /**
-   * 发一条待答消息到如流，并等用户回答。
+   * 发一条待答消息到如流，并返回「等回答」的句柄。
    *
    * 故意不设超时：Web GUI 也是"一直等着"的语义。只有回合被取消（signal abort）或
-   * 发送失败才收尾 —— 发送失败会让调用方 next() 交回 Web GUI，避免把回合挂死。
+   * 发送失败才收尾 —— 发送失败会让调用方 next() 完全交回 Web。
    * @param chatId - 如流会话 id。
    * @param text - 待答消息正文（自带 `/1`、`/2` 提示）。
    * @param options - { signal, expectsText }。
-   * @returns {Promise<{sent: boolean, picked?: number[][], text?: string}>}
+   * @returns {Promise<{sent: boolean, promise?: Promise, cancel?: () => void}>}
    */
   const askInRuliu = async (chatId, text, options = {}) => {
     try {
@@ -985,34 +999,61 @@ function mountTransport(ctx, config = {}) {
       log('ask-send-failed', { chatId, error: describeError(error) })
       return { sent: false }
     }
-    return await new Promise((resolve) => {
-      // 同一个聊天只留一个待答项：旧的按"取消"结算，避免回答张冠李戴
-      pendingAsks.get(chatId)?.resolve({})
-      const entry = { expectsText: options.expectsText === true }
-      entry.resolve = (value) => {
-        if (pendingAsks.get(chatId) === entry) pendingAsks.delete(chatId)
-        resolve({ sent: true, ...value })
-      }
-      pendingAsks.set(chatId, entry)
-      const signal = options.signal
-      if (signal !== undefined) {
-        if (signal.aborted) {
-          entry.resolve({})
-          return
-        }
-        signal.addEventListener('abort', () => entry.resolve({}), { once: true })
-      }
-    })
+    let settle
+    const promise = new Promise((resolve) => { settle = resolve })
+    // 同一个聊天只留一个待答项：旧的按"取消"结算，避免回答张冠李戴
+    pendingAsks.get(chatId)?.resolve({})
+    const entry = { expectsText: options.expectsText === true }
+    entry.resolve = (value) => {
+      if (pendingAsks.get(chatId) === entry) pendingAsks.delete(chatId)
+      settle({ sent: true, ...value })
+    }
+    pendingAsks.set(chatId, entry)
+    const signal = options.signal
+    if (signal !== undefined) {
+      if (signal.aborted) entry.resolve({})
+      else signal.addEventListener('abort', () => entry.resolve({}), { once: true })
+    }
+    return { sent: true, promise, cancel: () => entry.resolve({}) }
   }
+
+  /**
+   * 把「等 Web 那路」包成 race 候选。
+   *
+   * Web 那路的两种"非回答"结论必须排除掉，否则 race 会被瞬间判负：
+   *  - 审批：没有别的 answerer 时 resolve `'unavailable'`；
+   *  - 提问：没有别的 answerer 时 reject `NO_PROVIDER`（还有被取消时的 reject）。
+   * 提问的 resolve 一定是真回答（浏览器里点了），所以两种事件的判定不同。
+   * @param promise - next() 的返回值。
+   * @param options - { fulfilledIsAnswer }：resolve 是否算用户回答。
+   * @returns {Promise<{source: 'web', value?: any, error?: any}>}
+   */
+  const raceWeb = (promise, options = {}) => promise.then(
+    (value) => {
+      if (options.fulfilledIsAnswer === true) return { source: 'web', value }
+      return value === options.noAnswererValue ? NEVER : { source: 'web', value }
+    },
+    (error) => (options.rejectionIsAnswer === true ? { source: 'web', error } : NEVER),
+  )
 
   ctx.effect(() => ctx.on('approval/request', async (req, next) => {
     const chatId = sessions.chatOf(req?.agent?.session?.id)
     if (chatId === undefined) return next()
     const reason = String(req?.reason ?? req?.displayReason?.zh ?? req?.displayReason?.en ?? '')
-    const answer = await askInRuliu(chatId, renderApproval({ toolName: req?.toolName, reason }), { signal: req?.signal })
-    if (!answer.sent) return next()
-    const outcome = buildApprovalOutcome(answer.picked) ?? 'cancelled'
-    log('approval-answered', { chatId, toolName: req?.toolName, callId: req?.callId, outcome })
+    const bridged = await askInRuliu(chatId, `${renderApproval({ toolName: req?.toolName, reason })}\n\n（Web 页面里也有同一张卡片，两边答一边就行）`, { signal: req?.signal })
+    if (!bridged.sent) return next()
+    const first = await Promise.race([
+      // 审批：resolve 的 'unavailable' 表示没有别的 answerer，不算回答；reject 同理
+      raceWeb(next(), { noAnswererValue: 'unavailable' }),
+      bridged.promise.then((answer) => ({ source: 'im', answer })),
+    ])
+    if (first.source === 'web') {
+      bridged.cancel()
+      log('approval-answered', { chatId, toolName: req?.toolName, callId: req?.callId, outcome: first.value, via: 'web' })
+      return first.value
+    }
+    const outcome = buildApprovalOutcome(first.answer.picked) ?? 'cancelled'
+    log('approval-answered', { chatId, toolName: req?.toolName, callId: req?.callId, outcome, via: 'ruliu' })
     return outcome
   }, { prepend: true }), 'dsh-ruliu: 审批桥')
 
@@ -1023,13 +1064,23 @@ function mountTransport(ctx, config = {}) {
     const questions = Array.isArray(request?.questions) ? request.questions : []
     if (questions.length === 0) return next()
     const expectsText = questions.some((question) => !Array.isArray(question?.options) || question.options.length === 0)
-    const answer = await askInRuliu(chatId, renderQuestions(questions), { signal: request?.signal, expectsText })
-    if (!answer.sent) return next()
-    const choice = answer.picked === undefined
-      ? (answer.text === undefined ? undefined : { text: answer.text })
-      : { picked: answer.picked }
-    const answers = choice === undefined ? undefined : buildAnswers(questions, choice)
-    if (answers === undefined) return next()
+    const bridged = await askInRuliu(chatId, `${renderQuestions(questions)}\n\n（Web 页面里也有同一张卡片，两边答一边就行）`, { signal: request?.signal, expectsText })
+    if (!bridged.sent) return next()
+    const first = await Promise.race([
+      // 提问：resolve 一定是浏览器里的真回答；reject（NO_PROVIDER / 取消）继续等如流
+      raceWeb(next(), { fulfilledIsAnswer: true }),
+      bridged.promise.then((answer) => ({ source: 'im', answer })),
+    ])
+    if (first.source === 'web') {
+      bridged.cancel()
+      log('question-answered', { chatId, via: 'web' })
+      return first.value
+    }
+    const choice = first.answer.picked === undefined
+      ? (first.answer.text === undefined ? undefined : { text: first.answer.text })
+      : { picked: first.answer.picked }
+    const answers = choice === undefined ? [] : buildAnswers(questions, choice)
+    if (answers === undefined) return { answers: [] }
     // ask_user_question 默认 120 秒就超时：超时后问题变成 continued，只能用
     // answer() 按"迟到回复"补交；仍在等的问题 answer() 返回 false，交给返回值结算。
     const callId = request?.wait?.callId
@@ -1041,7 +1092,7 @@ function mountTransport(ctx, config = {}) {
         log('question-answer-failed', { chatId, callId, error: describeError(error) })
       }
     }
-    log('question-answered', { chatId, callId, count: answers.length })
+    log('question-answered', { chatId, callId, count: answers.length, via: 'ruliu' })
     return { answers }
   }, { prepend: true }), 'dsh-ruliu: 提问桥')
 
