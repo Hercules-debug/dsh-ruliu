@@ -23,6 +23,12 @@ test('client bundle registers a real settings section', () => {
   assert.equal(typeof client.apply, 'function')
 })
 
+test('the settings companion is byte-identical to the plugin client bundle', () => {
+  // 两份产物由同一个 client/settings.cjs 生成；只更新一份会让「宿主发新的、页面渲染旧的」
+  const companion = readFileSync(new URL('../ui/lib/client.js', import.meta.url), 'utf8')
+  assert.equal(companion, source)
+})
+
 test('blank secrets are omitted while changed secrets are write-only mutations', () => {
   const base = { value: { enabled: false, agentId: 7, apiHost: 'https://api.im.baidu.com' } }
   const ops = client.buildMutation(base, { appSecret: '', appKey: 'new-key', agentId: '8' })

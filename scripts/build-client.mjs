@@ -30,11 +30,19 @@ export function build({ check = false } = {}) {
   // Check syntax offline without executing the factory or touching Host APIs.
   new Function('window', artifact)
   if (check) return artifact
-  const output = resolve(root, 'lib/client.js')
-  const previous = existsSync(output) ? readFileSync(output, 'utf8') : undefined
-  if (previous !== artifact) {
-    mkdirSync(dirname(output), { recursive: true })
-    writeFileSync(output, artifact, 'utf8')
+  // 两份产物必须同源：
+  //   1) lib/client.js —— package.json 的 `./client`，正常安装时用这份；
+  //   2) ui/lib/client.js —— link 开发环境里 profile 按 `ui/index.mjs` 单独挂的
+  //      settings companion（绕过 dsh-ruliu 的 client 元数据负缓存）。
+  // 只生成其中一份会出现「宿主发的是新的、页面渲染的是旧的」这种漂移，实测踩过。
+  const outputs = [resolve(root, 'lib/client.js')]
+  if (existsSync(resolve(root, 'ui/package.json'))) outputs.push(resolve(root, 'ui/lib/client.js'))
+  for (const output of outputs) {
+    const previous = existsSync(output) ? readFileSync(output, 'utf8') : undefined
+    if (previous !== artifact) {
+      mkdirSync(dirname(output), { recursive: true })
+      writeFileSync(output, artifact, 'utf8')
+    }
   }
   return artifact
 }
@@ -42,5 +50,5 @@ export function build({ check = false } = {}) {
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
   const check = process.argv.includes('--check')
   build({ check })
-  console.log(check ? 'dsh-ruliu client source validated (no files written).' : 'Built lib/client.js deterministically.')
+  console.log(check ? 'dsh-ruliu client source validated (no files written).' : 'Built lib/client.js and ui/lib/client.js deterministically.')
 }
