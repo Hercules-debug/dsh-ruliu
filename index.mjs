@@ -532,33 +532,51 @@ function mountTransport(ctx, config = {}) {
   }
 
   /**
-   * 取每个会话的「最近活跃」时间（Unix 毫秒），供 `/list` 排序。
+   * 是不是「子代理子会话」。
+   *
+   * 子代理跑在自己的 session 里，首条消息是任务书，看起来就像一段新对话 —— 列出来会让人
+   * 以为「同一个会话里的多次对话被拆成了不同会话」。判定用 SessionHeader 的
+   * `origin === 'subagent'` 或 `delegationDepth > 0`；**不能**用 `parentSession` ——
+   * fork 出来的会话也有它，但那是用户自己的会话。
+   * @param header - SessionHeader。
+   * @returns 是子代理子会话返回 true。
+   */
+  const isChildSession = (header) => header?.origin === 'subagent' || Number(header?.delegationDepth ?? 0) > 0
+
+  /**
+   * 取会话的三样事实：最近活跃时间、子代理子会话、空白会话。
    *
    * 首选 `sessionController.list()`：它和 Web 侧边栏是同一个口径
    * （`updatedAt = max(createdAt, 最后一次用户消息时间)`），活跃会话和冷会话都覆盖，
-   * 所以从 Web 或如流任一侧刚聊过的会话都会浮到最上面。
+   * 所以从 Web 或如流任一侧刚聊过的会话都会浮到最上面。顺带拿到 `origin` / `blank`，
+   * 用来把**子代理子会话**和**还没说过话的空会话**排除掉 —— 侧边栏的 `sessionVisible()`
+   * 也是这么滤的，这两类都不是"用户自己的对话"。
    *
    * 该服务没挂载时（例如 headless profile）退回本插件自己从 `session/event` 攒的时间戳；
    * 两者都没有就只剩 `createdAt`，排序退化成「按创建时间倒序」。
-   * @returns {Promise<Map<string, number>>} 会话 id → 活跃时间。
+   * @returns {Promise<{times: Map<string, number>, children: Set<string>, blanks: Set<string>}>}
    */
-  const readActivityTimes = async () => {
+  const readSessionFacts = async () => {
     const times = new Map(activityAt)
+    const children = new Set()
+    const blanks = new Set()
     try {
       const controller = ctx.get?.('sessionController')
-      if (typeof controller?.list !== 'function') return times
+      if (typeof controller?.list !== 'function') return { times, children, blanks }
       const { items } = (await controller.list({}, AbortSignal.timeout(3000))) ?? {}
       for (const item of items ?? []) {
         const id = item?.sessionId
         if (id === undefined) continue
         const at = Number(item?.updatedAt ?? 0)
         if (Number.isFinite(at) && at > (times.get(id) ?? 0)) times.set(id, at)
+        if (item?.origin === 'subagent') children.add(id)
+        if (item?.blank === true) blanks.add(id)
       }
     } catch (error) {
       // 超时/服务不可用都不该让 /list 挂掉：退回兜底口径继续列
       log('activity-read-failed', { error: describeError(error) })
     }
-    return times
+    return { times, children, blanks }
   }
 
   /**
@@ -568,15 +586,24 @@ function mountTransport(ctx, config = {}) {
    * 之前这里恒抛，`/list` 就只剩内存里的活跃会话（即本插件自己建的），历史会话一条都没有。
    * 坑二：早先按 `createdAt` 排序，刚聊过的老会话永远沉在下面 —— 改成活跃时间后，
    * 「刚活跃的窗口」才会出现在第 1 条。
+   * 口径和 Web 侧边栏一致：**子代理子会话**（`origin === 'subagent'`）和**空白会话**
+   * 都不列 —— 前者是内部执行细节，后者是还没说过话的空壳；当前绑定的那条永远保留。
+   * @param keepId - 当前绑定的会话 id：即使它空白也不滤掉。
    * @returns {Promise<Array<{id, title, createdAt, activityAt}>>} 最多 10 条。
    */
-  const listSessions = async () => {
+  const listSessions = async (keepId) => {
     const rows = new Map()
+    const { times: activity, children, blanks } = await readSessionFacts()
+    const skipped = new Set()
+    /** 和侧边栏 sessionVisible 同口径：子代理 / 空白不列，当前绑定的除外。 */
+    const hidden = (id, header, blank) => id !== keepId
+      && (isChildSession(header) || children.has(id) || blank === true || blanks.has(id))
     try {
       for (const session of ctx.sessions?.list?.() ?? []) {
         const id = session?.id
         if (id === undefined) continue
         const header = session.header ?? {}
+        if (hidden(id, header, session.seq === 0)) { skipped.add(id); continue }
         // 只列本插件配置的工作目录，避免把整个 home 的会话都倒出来
         if (cwd !== '' && header.cwd !== undefined && header.cwd !== cwd) continue
         rows.set(id, { id, title: session.title ?? '', createdAt: header.createdAt ?? 0 })
@@ -589,13 +616,14 @@ function mountTransport(ctx, config = {}) {
       for (const snapshot of (await ctx.sessionPersistence.list()) ?? []) {
         const header = snapshot?.header ?? snapshot ?? {}
         if (header.id === undefined || rows.has(header.id)) continue
+        if (hidden(header.id, header, undefined)) { skipped.add(header.id); continue }
         if (cwd !== '' && header.cwd !== undefined && header.cwd !== cwd) continue
         rows.set(header.id, { id: header.id, title: '', createdAt: header.createdAt ?? 0 })
       }
     } catch (error) {
       log('session-persist-list-failed', { error: describeError(error) })
     }
-    const activity = await readActivityTimes()
+    if (skipped.size > 0) log('session-list-filtered', { children: skipped.size })
     const listing = [...rows.values()]
       .map((row) => ({ ...row, activityAt: Math.max(activity.get(row.id) ?? 0, row.createdAt ?? 0) }))
       .sort((a, b) => b.activityAt - a.activityAt || (b.createdAt ?? 0) - (a.createdAt ?? 0))
@@ -718,7 +746,7 @@ function mountTransport(ctx, config = {}) {
     }
 
     if (cmd === '/list' || cmd === '/sessions') {
-      lastListing = await listSessions()
+      lastListing = await listSessions(sessions.sessionOf(chatId))
       const bound = sessions.sessionOf(chatId)
       const rendered = renderSessions(lastListing, bound, await titleOfMissing(bound, lastListing))
       // 记一份渲染结果：IM 里发出去的内容在日志里看不到，排障时只能靠这行还原
@@ -731,7 +759,7 @@ function mountTransport(ctx, config = {}) {
       const index = Number.parseInt(arg, 10)
       const picked = Number.isInteger(index) ? lastListing[index - 1] : undefined
       if (picked === undefined) {
-        lastListing = await listSessions()
+        lastListing = await listSessions(sessions.sessionOf(chatId))
         const bound = sessions.sessionOf(chatId)
         const rendered = renderSessions(lastListing, bound, await titleOfMissing(bound, lastListing))
         await client.sendText(chatId, `没找到序号「${arg}」。先看看列表：\n\n${rendered}`)
