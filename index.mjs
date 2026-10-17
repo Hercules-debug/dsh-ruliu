@@ -349,6 +349,14 @@ function mountTransport(ctx, config = {}) {
   /** 最近一次 `/list` 的结果，供 `/use <序号>` 使用。 */
   let lastListing = []
 
+  /**
+   * 会话 id → 最近一次事件时间（Unix 毫秒），`/list` 排序用。
+   *
+   * 这是 `sessionController` 取不到时的兜底口径：只要本进程见过该会话的
+   * `session/event` 就记一笔，冷会话（没在内存里）自然没有记录。
+   */
+  const activityAt = new Map()
+
   /** 命令帮助文本。 */
   const helpText = () => [
     '📖 **可用命令**',
@@ -393,11 +401,43 @@ function mountTransport(ctx, config = {}) {
   }
 
   /**
-   * 列出可切换的会话：内存里的活跃会话 + 持久化里的历史会话，按时间倒序。
+   * 取每个会话的「最近活跃」时间（Unix 毫秒），供 `/list` 排序。
+   *
+   * 首选 `sessionController.list()`：它和 Web 侧边栏是同一个口径
+   * （`updatedAt = max(createdAt, 最后一次用户消息时间)`），活跃会话和冷会话都覆盖，
+   * 所以从 Web 或如流任一侧刚聊过的会话都会浮到最上面。
+   *
+   * 该服务没挂载时（例如 headless profile）退回本插件自己从 `session/event` 攒的时间戳；
+   * 两者都没有就只剩 `createdAt`，排序退化成「按创建时间倒序」。
+   * @returns {Promise<Map<string, number>>} 会话 id → 活跃时间。
+   */
+  const readActivityTimes = async () => {
+    const times = new Map(activityAt)
+    try {
+      const controller = ctx.get?.('sessionController')
+      if (typeof controller?.list !== 'function') return times
+      const { items } = (await controller.list({}, AbortSignal.timeout(3000))) ?? {}
+      for (const item of items ?? []) {
+        const id = item?.sessionId
+        if (id === undefined) continue
+        const at = Number(item?.updatedAt ?? 0)
+        if (Number.isFinite(at) && at > (times.get(id) ?? 0)) times.set(id, at)
+      }
+    } catch (error) {
+      // 超时/服务不可用都不该让 /list 挂掉：退回兜底口径继续列
+      log('activity-read-failed', { error: describeError(error) })
+    }
+    return times
+  }
+
+  /**
+   * 列出可切换的会话：内存里的活跃会话 + 持久化里的历史会话，按**最近活跃**倒序。
    *
    * 坑：`ctx.sessionPersistence` 必须写进 `inject` 才取得到（见文件顶部 inject 的注释）。
    * 之前这里恒抛，`/list` 就只剩内存里的活跃会话（即本插件自己建的），历史会话一条都没有。
-   * @returns {Promise<Array<{id, title, createdAt, live}>>} 最多 10 条。
+   * 坑二：早先按 `createdAt` 排序，刚聊过的老会话永远沉在下面 —— 改成活跃时间后，
+   * 「刚活跃的窗口」才会出现在第 1 条。
+   * @returns {Promise<Array<{id, title, createdAt, activityAt}>>} 最多 10 条。
    */
   const listSessions = async () => {
     const rows = new Map()
@@ -408,7 +448,7 @@ function mountTransport(ctx, config = {}) {
         const header = session.header ?? {}
         // 只列本插件配置的工作目录，避免把整个 home 的会话都倒出来
         if (cwd !== '' && header.cwd !== undefined && header.cwd !== cwd) continue
-        rows.set(id, { id, title: session.title ?? '', createdAt: header.createdAt ?? 0, live: true })
+        rows.set(id, { id, title: session.title ?? '', createdAt: header.createdAt ?? 0 })
       }
     } catch (error) {
       log('session-list-failed', { error: describeError(error) })
@@ -419,23 +459,27 @@ function mountTransport(ctx, config = {}) {
         const header = snapshot?.header ?? snapshot ?? {}
         if (header.id === undefined || rows.has(header.id)) continue
         if (cwd !== '' && header.cwd !== undefined && header.cwd !== cwd) continue
-        rows.set(header.id, { id: header.id, title: '', createdAt: header.createdAt ?? 0, live: false })
+        rows.set(header.id, { id: header.id, title: '', createdAt: header.createdAt ?? 0 })
       }
     } catch (error) {
       log('session-persist-list-failed', { error: describeError(error) })
     }
+    const activity = await readActivityTimes()
     const listing = [...rows.values()]
-      .sort((a, b) => (b.createdAt ?? 0) - (a.createdAt ?? 0))
+      .map((row) => ({ ...row, activityAt: Math.max(activity.get(row.id) ?? 0, row.createdAt ?? 0) }))
+      .sort((a, b) => b.activityAt - a.activityAt || (b.createdAt ?? 0) - (a.createdAt ?? 0))
       .slice(0, 10)
     await fillTitles(listing)
     return listing
   }
 
   /**
-   * 把会话列表渲染成 IM 文本。
+   * 把会话列表渲染成 IM 文本：只留序号 + 标题。
    *
    * 故意不打印 `session-<uuid>`：那是 DSH 的内部实现细节，IM 里的使用者既读不出
    * 信息量也用不上 —— 切换靠的是序号（`/use <序号>`），id 只在日志里出现。
+   * 也故意不打印创建时间和「🟢 活跃」：IM 是窄屏，这两项把标题挤到换行，
+   * 而「活跃」本来就是排序依据（活跃的排在最前），标出来是冗余信息。
    * @param rows - listSessions 的结果。
    * @returns 文本。
    */
@@ -443,10 +487,7 @@ function mountTransport(ctx, config = {}) {
     if (rows.length === 0) return '还没有任何会话。发送 `/new <提示词>` 开一个。'
     const lines = ['🗂 **最近的会话**（用 `/use <序号>` 切换）', '']
     rows.forEach((row, index) => {
-      const when = row.createdAt === 0 ? '' : new Date(row.createdAt).toLocaleString('zh-CN', { hour12: false })
-      const title = row.title === '' ? '(未命名)' : row.title
-      const marks = [row.live ? '🟢 活跃' : '', when].filter((part) => part !== '')
-      lines.push(`${index + 1}. ${title}${marks.length === 0 ? '' : ` · ${marks.join(' · ')}`}`)
+      lines.push(`${index + 1}. ${row.title === '' ? '(未命名)' : row.title}`)
     })
     return lines.join('\n')
   }
@@ -461,7 +502,7 @@ function mountTransport(ctx, config = {}) {
   const describeSession = async (id, liveAgent) => {
     if (id === undefined) return '(未绑定，下条消息会新建)'
     const state = liveAgent === undefined ? '（未在内存中，下条消息会 resume）' : '（活跃）'
-    const rows = [{ id, title: '', createdAt: 0, live: false }]
+    const rows = [{ id, title: '' }]
     await fillTitles(rows)
     const title = rows[0]?.title ?? ''
     return title === '' ? `已绑定${state}` : `「${title}」${state}`
@@ -497,8 +538,10 @@ function mountTransport(ctx, config = {}) {
 
     if (cmd === '/list' || cmd === '/sessions') {
       lastListing = await listSessions()
-      log('command-list', { chatId, count: lastListing.length })
-      await client.sendText(chatId, renderSessions(lastListing))
+      const rendered = renderSessions(lastListing)
+      // 记一份渲染结果：IM 里发出去的内容在日志里看不到，排障时只能靠这行还原
+      log('command-list', { chatId, count: lastListing.length, preview: rendered.slice(0, 300) })
+      await client.sendText(chatId, rendered)
       return { handled: true }
     }
 
@@ -694,6 +737,11 @@ function mountTransport(ctx, config = {}) {
 
   // ---- 出站：把 assistant 文本发回如流 ----
   ctx.effect(() => ctx.on('session/event', (session, event) => {
+    // 先记活跃时间，且必须在「是否绑定了如流会话」的提前返回之前：
+    // /list 的排序对全部会话都要用，不只是本插件建的。
+    if (session?.id !== undefined && typeof event?.time === 'number') {
+      activityAt.set(session.id, event.time)
+    }
     const chatId = sessions.chatOf(session?.id)
     if (chatId === undefined) return
     // 本轮相关事件全记：排障时能看出「回合有没有真的跑起来、为什么结束」
