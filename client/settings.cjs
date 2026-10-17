@@ -7,10 +7,10 @@ const {
 const h = React.createElement
 const NS = 'dsh-ruliu'
 const SECRETS = ['appKey', 'appSecret', 'checkToken', 'encodingAESKey']
-const VALUES = ['enabled', 'agentId', 'apiHost', 'webhookPath', 'cwd', 'msgType']
+const VALUES = ['enabled', 'agentId', 'apiHost', 'webhookPath', 'publicCallbackUrl', 'cwd', 'msgType']
 const DEFAULTS = Object.freeze({
   enabled: false, apiHost: 'https://api.im.baidu.com',
-  webhookPath: '/dsh-ruliu/webhook', cwd: '', msgType: 'text',
+  webhookPath: '/dsh-ruliu/webhook', publicCallbackUrl: '', cwd: '', msgType: 'text',
 })
 const own = (value, key) => Object.prototype.hasOwnProperty.call(value || {}, key)
 const effective = (view, key) => view?.value?.[key] ?? DEFAULTS[key]
@@ -47,6 +47,11 @@ function buildMutation(base, draft) {
       try { valid = ['http:', 'https:'].includes(new URL(value).protocol) } catch {}
       if (!valid) throw new Error('API 地址必须是有效的 HTTP 或 HTTPS URL。')
     }
+    if (key === 'publicCallbackUrl' && value !== '') {
+      let valid = false
+      try { valid = ['http:', 'https:'].includes(new URL(value).protocol) } catch {}
+      if (!valid) throw new Error('对外回调地址必须是有效的 HTTP 或 HTTPS URL，或留空。')
+    }
     if (value !== effective(base, key)) ops.push({ op: 'set', path: [key], value })
   }
   for (const key of SECRETS) {
@@ -61,6 +66,12 @@ function callbackURL(origin, path) {
   const route = String(path || DEFAULTS.webhookPath).trim()
   if (!route.startsWith('/') || route.startsWith('//') || /[?#\s]/.test(route)) return ''
   return origin ? origin.replace(/\/$/, '') + route : ''
+}
+
+/** 回调注册接口：回调路径的同级路径（和宿主侧 index.mjs 的推导保持一致）。 */
+function registerPath(path) {
+  const route = String(path || DEFAULTS.webhookPath).trim()
+  return `${route.replace(/\/[^/]*$/u, '')}/register`
 }
 
 /** Local snapshot store: drafts stay fenced to the revision at their first edit. */
@@ -235,8 +246,8 @@ class RuliuSettingsController {
 const secretCopy = {
   appKey: ['AppKey', '来源：如流开放平台的应用详情页。'],
   appSecret: ['AppSecret', '来源：如流开放平台同一应用的详情页；填写原始值，无需手动 MD5。'],
-  checkToken: ['checkToken（回调校验 Token）', '来源：如流开放平台「接收消息服务器」；两边须填写同一 Token。'],
-  encodingAESKey: ['AESKey（消息加密 Key）', '来源：如流开放平台「接收消息服务器」的 EncodingAESKey。'],
+  checkToken: ['checkToken（回调校验 Token）', '留空则由插件生成并注册到如流；也可以自己填，但要和如流后台一致。'],
+  encodingAESKey: ['AESKey（消息加密 Key）', '留空则由插件生成（16 字节随机 → 22 位）并注册到如流。'],
 }
 const layout = { display: 'flex', flexDirection: 'column', gap: 16, maxWidth: 720, color: 'var(--dsw-alias-label-primary)' }
 const hintStyle = { margin: 0, fontSize: 13, color: 'var(--dsw-alias-label-tertiary)', lineHeight: 1.6 }
@@ -244,9 +255,12 @@ const hintStyle = { margin: 0, fontSize: 13, color: 'var(--dsw-alias-label-terti
 function RuliuSettingsSection({ controller }) {
   const state = React.useSyncExternalStore(controller.subscribe, controller.getSnapshot, controller.getSnapshot)
   const [copyState, setCopyState] = React.useState('')
+  const [registerState, setRegisterState] = React.useState('')
+  const [registering, setRegistering] = React.useState(false)
   const disabled = !state.writable || state.saving || state.loading
   const displayed = (key) => own(state.draft, key) ? state.draft[key] : effective(state.base, key)
-  const url = callbackURL(globalThis.location?.origin || '', displayed('webhookPath'))
+  const derivedUrl = callbackURL(globalThis.location?.origin || '', displayed('webhookPath'))
+  const url = format(displayed('publicCallbackUrl')).trim() || derivedUrl
   const valueField = (key, label, hint, extra = {}) => h(SettingsValueField, {
     key, id: `ruliu-${key}`, label, hint, disabled,
     text: format(displayed(key)), overridden: false,
@@ -261,9 +275,28 @@ function RuliuSettingsSection({ controller }) {
       setCopyState('回调 URL 已复制。')
     } catch (error) { setCopyState(error?.message || '复制失败，请选中地址手动复制。') }
   }
+  // 调宿主侧的注册接口：它用已保存的凭证取 token，再把回调地址注册到如流
+  const register = async () => {
+    setRegistering(true)
+    setRegisterState('正在注册…')
+    try {
+      const response = await fetch(registerPath(displayed('webhookPath')), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ origin: globalThis.location?.origin || '' }),
+      })
+      const payload = await response.json().catch(() => null)
+      if (payload?.ok) setRegisterState(`✅ ${payload.message || '已注册到如流'}${payload.callbackUrl ? `（${payload.callbackUrl}）` : ''}`)
+      else setRegisterState(`❌ 注册失败：${payload?.message || `HTTP ${response.status}`}`)
+    } catch (error) {
+      setRegisterState(`❌ 注册失败：${error?.message || error}`)
+    } finally {
+      setRegistering(false)
+    }
+  }
   return h('section', { style: layout, 'aria-label': '如流设置' },
     h('h2', { style: { margin: 0, fontSize: 18, fontWeight: 500 } }, '如流'),
-    h('p', { style: hintStyle }, '填写如流机器人的 ID 与应用凭证，连接如流消息和 DSH 会话。'),
+    h('p', { style: hintStyle }, '填 AppKey 与 AppSecret 就能用：Token 和 AESKey 留空时由插件自动生成，并调如流接口注册回调地址。'),
     state.loading && h('p', { role: 'status', style: hintStyle }, '正在加载如流设置…'),
     state.error && h('p', { role: 'alert', style: { ...hintStyle, color: 'var(--dsw-alias-state-error-primary)' } }, state.error),
     state.success && h('p', { role: 'status', style: { ...hintStyle, color: 'var(--dsw-alias-state-success-primary)' } }, '如流设置已保存。'),
@@ -288,12 +321,13 @@ function RuliuSettingsSection({ controller }) {
       stateLabel: configured(key) ? '已配置（Host）' : '未配置',
       onEdit: (text) => controller.edit(key, text),
     })),
-    !SECRETS.every(configured) && h('p', { role: 'status', style: hintStyle }, '凭证尚未配置完整；启用前请填写四项凭证。'),
+    (!configured('appKey') || !configured('appSecret')) && h('p', { role: 'status', style: hintStyle }, '启用前至少要填 AppKey 和 AppSecret；Token 与 AESKey 留空时由插件自动生成并注册到如流。'),
     h('details', null,
       h('summary', { style: { cursor: 'pointer', marginBottom: 12 } }, '高级设置'),
       h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
         valueField('apiHost', 'API 地址', '默认 https://api.im.baidu.com；可填写当前部署使用的如流 API 地址。'),
         valueField('webhookPath', '回调路径', '默认 /dsh-ruliu/webhook；保存后须与如流后台回调地址一致。'),
+        valueField('publicCallbackUrl', '对外回调地址', '如流服务器能访问到的完整地址（例如 http://10.206.116.22:8080/dsh-ruliu/webhook）；留空则按浏览器地址 / 本机内网地址自动推导。'),
         valueField('cwd', '会话工作目录', '填写 DSH Host 上的工作目录；留空使用 Host 默认目录。'),
         valueField('msgType', '消息类型', '填写 text（纯文本）或 md（Markdown）；默认 text。'),
       )),
@@ -301,9 +335,14 @@ function RuliuSettingsSection({ controller }) {
     h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
       h('label', { htmlFor: 'ruliu-callback-url' }, '回调 URL'),
       h('input', { id: 'ruliu-callback-url', readOnly: true, value: url, 'aria-label': '回调 URL', onFocus: (event) => event.target.select(), style: { width: '100%', boxSizing: 'border-box', color: 'inherit', background: 'var(--dsw-alias-settings-card-fill)', border: '1px solid var(--dsw-alias-border-l3)', borderRadius: 8, padding: 10 } }),
-      h('div', null, h(Button, { type: 'button', variant: 'secondary', disabled: !url, onClick: copy }, '复制回调 URL')),
-      h('p', { style: hintStyle }, '地址按当前浏览器 origin 与回调路径生成；路径修改后请先保存。请确保如流服务器能访问该地址；本机 localhost / 127.0.0.1 通常不可达。'),
+      h('div', { style: { display: 'flex', gap: 8 } },
+        h(Button, { type: 'button', variant: 'secondary', disabled: !url, onClick: copy }, '复制回调 URL'),
+        h(Button, { type: 'button', variant: 'secondary', disabled: disabled || registering || state.dirty || !configured('appKey'), onClick: register }, registering ? '注册中…' : '注册回调到如流')),
+      h('p', { style: hintStyle }, state.dirty
+        ? '有未保存的修改：先保存，再点「注册回调到如流」。'
+        : '「注册回调到如流」会用已保存的 AppKey/AppSecret 取 token，把上面的回调地址和 Token/AESKey 一起写到如流机器人后台（等价官方 SDK 的 starter.register）。地址必须能被如流服务器访问到，本机 localhost / 127.0.0.1 不行。'),
       copyState && h('p', { role: 'status', style: hintStyle }, copyState),
+      registerState && h('p', { role: 'status', style: hintStyle }, registerState),
     )),
   )
 }
@@ -326,4 +365,4 @@ function apply(ctx) {
   }, RuliuSettingsSection))
 }
 
-module.exports = { inject, apply, buildMutation, callbackURL, RuliuSettingsController }
+module.exports = { inject, apply, buildMutation, callbackURL, registerPath, RuliuSettingsController }

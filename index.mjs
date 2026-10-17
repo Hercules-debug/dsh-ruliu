@@ -30,6 +30,9 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { createRuliuClient } from './lib/ruliu.mjs'
 import { Config, validateConfiguration } from './lib/config.mjs'
+import {
+  deriveCallbackURL, generateAESKey, generateCheckToken, registerCallback,
+} from './lib/callback.mjs'
 
 export { Config }
 
@@ -89,6 +92,37 @@ function createFileLog(stateDir) {
     } catch {
       /* 记日志失败不该影响对话 */
     }
+  }
+}
+
+/**
+ * 读插件自己的回调状态文件 `<stateDir>/callback.json`。
+ *
+ * 存的是「插件生成的 token / AESKey」和「最近一次注册用的地址」。生成的这组值必须
+ * 固定下来：如果每次重启都换一把新 key，如流那边还是旧的，握手就会 403。
+ * @param stateDir - 插件状态目录。
+ * @returns 读不到或损坏时返回空对象。
+ */
+function readCallbackState(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync(join(stateDir, 'callback.json'), 'utf8'))
+    return parsed !== null && typeof parsed === 'object' ? parsed : {}
+  } catch {
+    return {}
+  }
+}
+
+/**
+ * 写回调状态文件（含密钥，权限 0600）；失败只当没记住，不影响通道。
+ * @param stateDir - 插件状态目录。
+ * @param state - 待写入的状态对象。
+ */
+function writeCallbackState(stateDir, state) {
+  try {
+    mkdirSync(stateDir, { recursive: true, mode: 0o700 })
+    writeFileSync(join(stateDir, 'callback.json'), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 })
+  } catch {
+    /* 状态写不进去不该影响通道 */
   }
 }
 
@@ -300,17 +334,90 @@ function mountTransport(ctx, config = {}) {
     return
   }
 
-  const client = createRuliuClient(config, logger)
-  if (client === undefined) {
-    logger?.warn?.('dsh-ruliu: 凭证不全（需要 appKey + appSecret），通道未挂载')
-    return
-  }
-
   const webhookPath = config.webhookPath || '/dsh-ruliu/webhook'
   const cwd = config.cwd || process.cwd()
   const stateDir = config.stateDir || join(resolveProfileDir(), '.dsh-ruliu')
   const sessions = new SessionMap(join(stateDir, 'sessions.json'), logger)
   const log = createFileLog(stateDir)
+
+  // ---- 凭证：AppKey/AppSecret 必须由用户填；token/AESKey 缺了就自己生成 ----
+  //
+  // 依据官方 SDK：token 和 encodingAesKey 是调用方生成后调 updateReCallUrl 告诉
+  // 如流的，不是如流下发的。所以用户只填两个字段也能跑：这里生成一次并落盘，
+  // 之后重启复用同一组（换 key 会让如流那边的旧值对不上，握手 403）。
+  const storedCallback = readCallbackState(stateDir)
+  const configuredToken = String(config.checkToken ?? '').trim()
+  const configuredAESKey = String(config.encodingAESKey ?? '').trim()
+  const storedToken = String(storedCallback.checkToken ?? '')
+  const storedAESKey = String(storedCallback.encodingAESKey ?? '')
+  // 只有「配置里没有、上次也没存过」才算新生成 —— 复用旧值时不该再注册一遍，
+  // 否则每次挂载都会去动如流后台的注册。
+  const generatedToken = configuredToken === '' && storedToken === ''
+  const generatedAESKey = configuredAESKey === '' && storedAESKey === ''
+  const checkToken = configuredToken || storedToken || generateCheckToken()
+  const encodingAESKey = configuredAESKey || storedAESKey || generateAESKey()
+  const credentialsGenerated = generatedToken || generatedAESKey
+  if (credentialsGenerated) {
+    writeCallbackState(stateDir, { ...storedCallback, checkToken, encodingAESKey })
+    log('credentials-resolved', { generated: true, aesKeyChars: encodingAESKey.length })
+  }
+
+  const client = createRuliuClient({ ...config, checkToken, encodingAESKey }, logger)
+  if (client === undefined) {
+    logger?.warn?.('dsh-ruliu: 凭证不全（需要 appKey + appSecret），通道未挂载')
+    return
+  }
+
+  /**
+   * 把回调地址 + token + AESKey 注册到如流机器人后台。
+   *
+   * 只在「用户没填 token/AESKey、由插件生成」或「设置页手动点注册」时调用：
+   * 已有完整配置的机器人不去动它 —— 万一推导出的地址不对，重注册会把能用的回调
+   * 改坏。注册失败只记日志，webhook 照常服务。
+   * @param options - callbackUrl（显式指定，优先）/ origin（浏览器地址，用于推导）/
+   *   trigger（auto | manual，仅日志用）。
+   * @returns {Promise<{ok: boolean, code: string, message: string, callbackUrl: string}>}
+   */
+  const registerRuliuCallback = async ({ callbackUrl: explicitUrl, origin, trigger } = {}) => {
+    const explicit = String(explicitUrl ?? '').trim()
+    const callbackUrl = explicit !== '' ? explicit : deriveCallbackURL({
+      publicCallbackUrl: config.publicCallbackUrl,
+      webhookPath,
+      origin,
+      // 宿主侧没有浏览器，只能靠 DSH_WEB_URL / webServer 端口推；回环会被跳过
+      dshWebUrl: process.env.DSH_WEB_URL || `http://127.0.0.1:${ctx.webServer?.port ?? 8080}`,
+    })
+    if (callbackUrl === '') {
+      const result = { ok: false, code: 'no-url', message: '推导不出如流能访问的回调地址，请在设置里填「对外回调地址」。', callbackUrl }
+      log('callback-register', { trigger, ...result })
+      return result
+    }
+    let result
+    try {
+      result = await registerCallback({
+        apiHost: config.apiHost,
+        appKey: config.appKey,
+        appSecret: config.appSecret,
+        callbackUrl,
+        checkToken,
+        encodingAESKey,
+      })
+    } catch (error) {
+      result = { ok: false, code: 'error', message: describeError(error) }
+    }
+    log('callback-register', { trigger, callbackUrl, ok: result.ok, code: result.code, message: result.message })
+    if (result.ok) {
+      writeCallbackState(stateDir, {
+        ...readCallbackState(stateDir), checkToken, encodingAESKey, callbackUrl, registeredAt: new Date().toISOString(),
+      })
+    }
+    return { ...result, callbackUrl }
+  }
+
+  // 只有「刚生成 token/AESKey」时才自动注册一次，把首次配置也变成只填两个字段
+  if (credentialsGenerated) {
+    void registerRuliuCallback({ trigger: 'auto' }).catch((error) => log('callback-register-failed', { error: describeError(error) }))
+  }
 
   /** chatId → 最近一条入站消息 id，用于群聊的引用回复。 */
   const lastInboundId = new Map()
@@ -765,6 +872,48 @@ function mountTransport(ctx, config = {}) {
       else if (parsed?.kind === 'ignore') log('ignored', { reason: String(parsed.reason ?? '') })
     },
   }), 'dsh-ruliu: 如流回调路由')
+
+  // ---- 手动注册：设置页「注册回调到如流」按钮打进来的口子 ----
+  //
+  // 回调路径的同级路径（`/dsh-ruliu/webhook` → `/dsh-ruliu/register`）。只做同源
+  // 校验：带 Origin 的请求必须和 Host 一致，挡掉别的站点顺手改注册。这个口子不
+  // 回显任何密钥，只返回注册结果。
+  const registerPath = `${webhookPath.replace(/\/[^/]*$/u, '')}/register`
+  ctx.effect(() => ctx.webServer.register({
+    kind: 'exact',
+    path: registerPath,
+    handler: async (req, res) => {
+      if (req.method !== 'POST') {
+        send(res, 405, 'text/plain; charset=utf-8', 'Method Not Allowed')
+        return
+      }
+      const origin = String(req.headers?.origin ?? '')
+      const host = String(req.headers?.host ?? '')
+      if (origin !== '' && !origin.endsWith(`//${host}`)) {
+        log('callback-register-rejected', { origin, host })
+        send(res, 403, 'application/json; charset=utf-8', JSON.stringify({ ok: false, message: 'cross-origin request rejected' }))
+        return
+      }
+      let raw = ''
+      try {
+        raw = await readBody(req)
+      } catch {
+        /* 空体也允许：用配置/推导出的地址 */
+      }
+      let payload = {}
+      try {
+        payload = raw === '' ? {} : JSON.parse(raw)
+      } catch {
+        payload = {}
+      }
+      const result = await registerRuliuCallback({
+        callbackUrl: typeof payload?.callbackUrl === 'string' ? payload.callbackUrl : '',
+        origin: typeof payload?.origin === 'string' ? payload.origin : origin,
+        trigger: 'manual',
+      })
+      send(res, 200, 'application/json; charset=utf-8', JSON.stringify(result))
+    },
+  }), 'dsh-ruliu: 回调注册路由')
 
   // ---- 出站：把 assistant 文本发回如流 ----
   ctx.effect(() => ctx.on('session/event', (session, event) => {

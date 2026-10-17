@@ -20,7 +20,7 @@
   "dependencies": { "@deepseek-ai/schemastery": "~3.18.4" },
   "scripts": {
     "build": "node scripts/build-client.mjs",
-    "test": "node --test test/config.test.mjs test/transport-lifecycle.test.mjs test/settings-client.test.mjs && node test/protocol.test.mjs"
+    "test": "node --test test/config.test.mjs test/callback.test.mjs test/transport-lifecycle.test.mjs test/settings-client.test.mjs && node test/protocol.test.mjs"
   },
   "engines": { "node": ">=22" }
 }

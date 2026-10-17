@@ -5,8 +5,11 @@ import vm from 'node:vm'
 
 const source = readFileSync(new URL('../lib/client.js', import.meta.url), 'utf8')
 let descriptor
+// 浏览器里有 URL / fetch；vm 上下文默认没有，补上再跑，否则校验分支会走进 catch
 vm.runInNewContext(source, {
   window: { __ModuleLoader__: { load(value) { descriptor = value } } },
+  URL,
+  fetch: () => Promise.reject(new Error('fetch is not available in this test')),
 })
 assert.equal(descriptor.id, 'dsh-ruliu')
 const fakeReact = { createElement: () => null, useSyncExternalStore: () => ({}), useState: () => ['', () => {}] }
@@ -41,4 +44,14 @@ test('clearing the optional robot id unsets it instead of writing an empty value
 test('callback URL uses the configured route and rejects unsafe routes', () => {
   assert.equal(client.callbackURL('http://10.0.0.2:8080', '/dsh-ruliu/webhook'), 'http://10.0.0.2:8080/dsh-ruliu/webhook')
   assert.equal(client.callbackURL('http://10.0.0.2:8080', '//other.example'), '')
+})
+
+test('register path is the sibling of the callback path and the address is a plain value', () => {
+  assert.equal(client.registerPath('/dsh-ruliu/webhook'), '/dsh-ruliu/register')
+  assert.equal(client.registerPath('/hook'), '/register')
+  const base = { value: { enabled: true, webhookPath: '/dsh-ruliu/webhook' } }
+  assert.deepEqual(JSON.parse(JSON.stringify(client.buildMutation(base, { publicCallbackUrl: 'http://10.206.116.22:8080/dsh-ruliu/webhook' }))), [
+    { op: 'set', path: ['publicCallbackUrl'], value: 'http://10.206.116.22:8080/dsh-ruliu/webhook' },
+  ])
+  assert.throws(() => client.buildMutation(base, { publicCallbackUrl: 'not-a-url' }), /对外回调地址/u)
 })

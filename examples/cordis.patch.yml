@@ -1,15 +1,20 @@
 # 复制到：$DSH_HOME/profiles/web/cordis.patch.yml
 # 再把下面尖括号里的值替换成你自己的真实配置。
 # 不要把填好真实值的文件提交到 GitHub。
+#
+# 只需要 appKey + appSecret 两项：checkToken / encodingAESKey 留空时，插件会随机生成
+# 一组并调 POST /api/v1/imRobot/updateReCallUrl 注册到如流机器人后台（生成的值落在
+# <profile>/.dsh-ruliu/callback.json）。也可以自己填，但要和如流后台一致。
 - id: dsh-ruliu
   config:
     enabled: true
     appKey: '<这里填如流开放平台的 AppKey>'
     appSecret: '<这里填如流开放平台的 AppSecret>'
-    agentId: 123456                 # 机器人 Agent ID，只填数字
-    checkToken: '<这里填回调校验 Token>'
-    encodingAESKey: '<这里填消息加密 AES Key，通常是 22 位>'
+    agentId: 123456                 # 机器人 Agent ID，只填数字；不需要可以留空
+    checkToken: ''                  # 留空 = 插件生成并注册
+    encodingAESKey: ''              # 留空 = 插件生成并注册
     apiHost: 'https://api.im.baidu.com' # 百度内网可改为 http://apiin.im.baidu.com
     webhookPath: '/dsh-ruliu/webhook'
+    publicCallbackUrl: ''           # 如流能访问到的完整回调地址；留空 = 自动推导
     cwd: '/path/to/your/workspace'      # 改成 DSH 实际工作目录
     msgType: 'text'                     # text | md

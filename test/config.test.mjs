@@ -24,11 +24,16 @@ test('existing profile configuration remains compatible', () => {
   assert.equal(config.stateDir, '/state')
 })
 
-test('enabled channel rejects missing credentials but accepts an omitted robot id', () => {
-  for (const field of ['appKey', 'appSecret', 'checkToken', 'encodingAESKey']) {
+test('enabled channel requires only the app credentials; token/AESKey may be generated', () => {
+  for (const field of ['appKey', 'appSecret']) {
     const config = Config({ ...valid, [field]: '' }).get()
     assert.throws(() => validateConfiguration(config), /启用如流前/)
   }
+  // token / AESKey 留空 = 由插件生成并调 updateReCallUrl 注册，不再要求用户填
+  const generated = Config({ ...valid, checkToken: '', encodingAESKey: '' }).get()
+  validateConfiguration(generated)
+  // 填了就必须是合法的 Base64URLSafe 密钥
+  assert.throws(() => validateConfiguration(Config({ ...valid, encodingAESKey: 'short' }).get()), /AES Key/)
   // 机器人 ID 可选：留空（unset）时照常启用，发送路径不带 agentid
   const withoutAgent = Config({ ...valid, agentId: undefined }).get()
   assert.equal(withoutAgent.agentId, undefined)

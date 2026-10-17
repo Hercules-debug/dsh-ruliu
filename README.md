@@ -17,9 +17,22 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 ## 配置
 
-安装并重新加载 DSH 后，在 Web UI 的 **设置 → 如流** 中填写应用凭证与回调密钥，使用方式和填写 API Key 类似。页面里的四项密钥是密码输入框，只显示“已配置”，不会回显原文；保存时留空表示保留已有密钥。
+安装并重新加载 DSH 后，在 Web UI 的 **设置 → 如流** 里**只填 AppKey 和 AppSecret 就能用**：
+回调校验 Token 和消息加密 AES Key 留空时，插件会随机生成一组，并调如流接口
+`POST /api/v1/imRobot/updateReCallUrl` 把回调地址和这两个值注册到机器人后台
+（等价官方 SDK 的 `starter.register()`）。页面里的密钥是密码输入框，只显示“已配置”，
+不会回显原文；保存时留空表示保留已有密钥。
 
-设置页提供以下字段：AppKey、AppSecret、回调校验 Token、消息加密 AES Key（这四项必填），机器人 Agent ID（可选），以及接口地址、回调路径、工作目录和消息类型。页面还会根据当前 DSH 地址生成可复制的回调 URL。
+设置页字段：AppKey、AppSecret（**必填**），机器人 Agent ID（可选），回调校验 Token、
+消息加密 AES Key（可选，留空自动生成），以及「高级设置」里的接口地址、回调路径、
+对外回调地址、工作目录和消息类型。页面下方还有「复制回调 URL」和「注册回调到如流」两个按钮。
+
+**为什么 Token / AESKey 能自动来**：如流只发给你 AppKey / AppSecret。收消息是如流主动往
+你的机器推，它需要知道推到哪里（回调地址）、并用一组密钥签名+加密 —— 而**这组密钥是调用方
+生成后通过 `updateReCallUrl` 告诉如流的**，不是如流下发的。所以插件可以自己生成、自己注册。
+
+生成的这组值落在 `<profile>/.dsh-ruliu/callback.json`（权限 0600），重启后复用同一组；
+只有「配置里没有、上次也没存过」时才生成并注册一次，已有配置的机器人不会被重复改动。
 
 如果当前 DSH 是已经运行的旧版本，安装新版本后需要让插件重新加载一次；本地 link 开发环境还需要加载仓库里的 settings companion。正常从新版本安装时，客户端设置页面随插件一起加载。
 
@@ -34,50 +47,55 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
     appKey: '<这里填如流开放平台的 AppKey>'
     appSecret: '<这里填如流开放平台的 AppSecret>'
     agentId: 123456                 # 机器人 Agent ID，只填数字；不需要可以留空
-    checkToken: '<这里填回调校验 Token>'
-    encodingAESKey: '<这里填消息加密 AES Key，通常是 22 位>'
+    checkToken: ''                  # 留空 = 插件生成并注册
+    encodingAESKey: ''              # 留空 = 插件生成并注册
     apiHost: 'https://api.im.baidu.com'
     webhookPath: '/dsh-ruliu/webhook'
+    publicCallbackUrl: ''           # 留空 = 按浏览器地址/本机内网地址推导
     cwd: '/path/to/your/workspace'
     msgType: 'text'
 ```
 
-必须填写的值一共有四项：
+必须填写的只有两项：
 
 | 配置项 | 填什么 | 从哪里获取 |
 |---|---|---|
 | `appKey` | 如流应用 AppKey | 如流开放平台的应用详情页 |
 | `appSecret` | 如流应用 AppSecret | 同一个应用详情页；插件会自动计算接口所需的 md5，不要手动加密 |
-| `checkToken` | 回调校验 Token | 如流开放平台「接收消息服务器」配置页；自己生成并填入两边也可以 |
-| `encodingAESKey` | 消息加密 AES Key | 如流开放平台「接收消息服务器」配置页；通常是 22 位字符串 |
 
-`agentId`（机器人 ID）**可选**：留空时发消息不带 `agentid` 字段，只影响部分需要它的接口。
+其余都是可选的：
+
+| 配置项 | 说明 |
+|---|---|
+| `checkToken` | 回调校验 Token。留空则由插件生成并注册到如流；填了就必须和如流后台一致 |
+| `encodingAESKey` | 消息加密 AES Key。留空则由插件生成（16 字节随机 → 22 位 Base64URLSafe） |
+| `agentId` | 机器人 ID。留空时发消息不带 `agentid` 字段，只影响部分需要它的接口 |
 
 `appKey` 和 `appSecret` 是如流**发给你的**应用凭证（用来换 `app_access_token` 发消息）；
-`checkToken` 和 `encodingAESKey` 不是平台发给你的值，而是**回调模式下的双方约定值** ——
-如流推送事件时会用它们签名、加密，所以必须在如流后台和本插件里填成一样的，
-没法从 AppKey/AppSecret 推导出来。它们也不是本项目生成的值，不要把真实值提交到 GitHub。
+`checkToken` 和 `encodingAESKey` 是**调用方生成、注册给如流的**，所以插件能自动搞定。
+不要把真实值提交到 GitHub。
 
 | 字段 | 必需 | 说明 |
 |---|---|---|
 | `apiHost` | 可选 | 默认 `https://api.im.baidu.com`；百度内网机器通常使用 `http://apiin.im.baidu.com` |
 | `webhookPath` | 可选 | 默认 `/dsh-ruliu/webhook`，要和如流后台填的一致 |
+| `publicCallbackUrl` | 可选 | 如流服务器能访问到的**完整**回调地址，例如 `http://10.206.116.22:8080/dsh-ruliu/webhook`；留空则按「浏览器 origin → `DSH_WEB_URL` → 本机内网 IPv4」推导 |
 | `cwd` | 可选 | 新建 DSH 会话的工作目录，改成 DSH 实际运行的目录 |
 | `msgType` | 可选 | 出站消息类型，`text`（默认）或 `md` |
 
-**机器地址也要填**：在如流后台「接收消息服务器」里，把回调 URL 填成下面的形式，把 `<机器内网IP>` 换成运行 DSH 的机器 IP：
+**机器地址**：如流后台「接收消息服务器」里的回调 URL 必须是**如流服务器能访问到的**地址：
 
 ```text
 http://<机器内网IP>:8080/dsh-ruliu/webhook
 ```
 
-例如 DSH 机器内网 IP 是 `10.10.20.35`，就填：
+例如 DSH 机器内网 IP 是 `10.10.20.35`，就填 `http://10.10.20.35:8080/dsh-ruliu/webhook`。
+不能填 `127.0.0.1` 或 `localhost`；DSH 不监听 8080 时换成实际端口。
 
-```text
-http://10.10.20.35:8080/dsh-ruliu/webhook
-```
-
-这里的机器 IP 必须是如流服务器能访问到的地址，不能填 `127.0.0.1` 或 `localhost`。如果 DSH 不是监听 8080 端口，还要把 URL 中的端口改成实际端口。
+这一段**不用手工去如流后台填**：设置页点「注册回调到如流」就会把地址 + Token + AESKey 一起
+写进机器人后台；首次配置（Token/AESKey 留空）时插件挂载后也会自动注册一次。地址推导顺序是
+`publicCallbackUrl` → 浏览器 origin → `DSH_WEB_URL` → 探测到的本机内网 IPv4，跳回环和 docker0
+之类的虚拟网卡。推导不出来时，在设置页「高级设置 → 对外回调地址」里显式填一个。
 
 如流会先发一次 `echostr` 校验（插件按 `md5(rn + timestamp + checkToken)` 验签并原样回显），通过后才开始推消息。
 
@@ -141,6 +159,11 @@ http://10.10.20.35:8080/dsh-ruliu/webhook
   大整数 id 精确、重投去重、未知 Content-Type/缺 Encrypt/解密失败的 400/500 分支、非文本消息忽略。
 - 端到端（真实凭证 + 内网如流）：`test/commands.test.mjs` 往活路由注入命令，
   `/help` `/status` `/list` 的收发、会话映射复用、出站回推均通。
+- 回调注册（`test/callback.test.mjs` 离线 + 真机各一次）：token/AESKey 生成形态、
+  内网地址选择（跳过 docker0 / link-local）、回调地址推导优先级、`updateReCallUrl`
+  的请求体与鉴权头；真机上把配置里的 token/AESKey 清空后，插件自动生成 → 自动注册
+  （`code: "ok"`）→ 用新密钥收 + 回消息成功，重载后复用 `callback.json` 里的同一组、
+  不再重复注册。
 
 **未验证**：真实报文的字段全貌、群聊 @ 语义、图片/文件消息、websocket 模式。
 
@@ -154,8 +177,12 @@ http://10.10.20.35:8080/dsh-ruliu/webhook
 
 ## 排错
 
-- **回调 403**：`checkToken` 与后台不一致。
+- **回调 403**：`checkToken` 与如流后台不一致。改过 Token 或换过机器后，点一次设置页的
+  「注册回调到如流」重新注册（或删掉 `<profile>/.dsh-ruliu/callback.json` 让插件重新生成并注册）。
 - **回调 500 / decryption failed**：`encodingAESKey` 不对（注意它是 Base64URLSafe，原始 22 位）。
+- **注册失败**：日志里看 `callback-register` 事件的 `code` / `message`；常见原因是推导出的回调地址
+  如流访问不到（填「对外回调地址」），或宿主装了代理导致 `apiin.im.baidu.com` 走代理返回 502
+  （把该域名加进代理直连名单）。注册失败不影响 webhook 继续服务，已注册过的机器人照常推消息。
 - **回调 400 unsupported content type**：请求没带正确的 `Content-Type`，或后台推的不是这三种形态。
 - **发消息失败**：看 `Authorization: Bearer-<token>`（连字符）与 `code:"ok"`（字符串）判定；
   出站走的是宿主进程的 fetch，若 `api.im.baidu.com` 在内网直连而宿主装了代理，
