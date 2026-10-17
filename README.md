@@ -17,22 +17,17 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 ## 配置
 
-安装并重新加载 DSH 后，在 Web UI 的 **设置 → 如流** 里**只填 AppKey 和 AppSecret 就能用**：
-回调校验 Token 和消息加密 AES Key 留空时，插件会随机生成一组，并调如流接口
-`POST /api/v1/imRobot/updateReCallUrl` 把回调地址和这两个值注册到机器人后台
-（等价官方 SDK 的 `starter.register()`）。页面里的密钥是密码输入框，只显示“已配置”，
-不会回显原文；保存时留空表示保留已有密钥。
+安装并重新加载 DSH 后，在 Web UI 的 **设置 → 如流** 里填四项：**AppKey、AppSecret**（如流发给你的应用凭证）
+以及 **checkToken、AESKey**（如流后台「接收消息服务器」里的两个值）。回调地址与注册由插件负责，
+点一次「注册回调到如流」即可。
 
-设置页字段：AppKey、AppSecret（**必填**），机器人 Agent ID（可选），回调校验 Token、
-消息加密 AES Key（可选，留空自动生成），以及「高级设置」里的接口地址、回调路径、
-对外回调地址、工作目录和消息类型。页面下方还有「复制回调 URL」和「注册回调到如流」两个按钮。
-
-**为什么 Token / AESKey 能自动来**：如流只发给你 AppKey / AppSecret。收消息是如流主动往
-你的机器推，它需要知道推到哪里（回调地址）、并用一组密钥签名+加密 —— 而**这组密钥是调用方
-生成后通过 `updateReCallUrl` 告诉如流的**，不是如流下发的。所以插件可以自己生成、自己注册。
-
-生成的这组值落在 `<profile>/.dsh-ruliu/callback.json`（权限 0600），重启后复用同一组；
-只有「配置里没有、上次也没存过」时才生成并注册一次，已有配置的机器人不会被重复改动。
+> **为什么不默认自动生成 Token/AESKey**：官方 SDK 的 `updateCallbackUrl` 确实接受调用方生成的
+> token / encodingAesKey，但实测在**如流后台已经配过「接收消息服务器」的机器人**上，接口带过去的
+> 新 AESKey 不一定被消息管道采用 —— 表现是如流推来的消息解不开（webhook 回 `500 decryption failed`），
+> 而接口不回显落库内容、也没法查询，出问题时很难发现。所以自动生成改成显式开关
+> `autoRegisterCallback`（默认 `false`，在设置页「高级设置」里）：只有明确知道这个机器人的密钥
+> 由插件管理时才打开。解密失败时插件会往已知如流会话发一条告警（出站不依赖 AESKey，还发得出去），
+> 不会让你只看到「发消息没反应」。
 
 如果当前 DSH 是已经运行的旧版本，安装新版本后需要让插件重新加载一次；本地 link 开发环境还需要加载仓库里的 settings companion。正常从新版本安装时，客户端设置页面随插件一起加载。
 
@@ -53,8 +48,9 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
     appKey: '<这里填如流开放平台的 AppKey>'
     appSecret: '<这里填如流开放平台的 AppSecret>'
     agentId: 123456                 # 机器人 Agent ID，只填数字；不需要可以留空
-    checkToken: ''                  # 留空 = 插件生成并注册
-    encodingAESKey: ''              # 留空 = 插件生成并注册
+    checkToken: '<如流后台「接收消息服务器」里的 Token>'
+    encodingAESKey: '<同一个页面里的 EncodingAESKey，22 位>'
+    autoRegisterCallback: false      # true 时上面两项可留空，由插件生成并注册（见上文风险）
     apiHost: 'https://api.im.baidu.com'
     webhookPath: '/dsh-ruliu/webhook'
     publicCallbackUrl: ''           # 留空 = 按浏览器地址/本机内网地址推导
@@ -73,8 +69,8 @@ bundle 默认 `enabled: false`（不会自己启动）。启用要在 profile �
 
 | 配置项 | 说明 |
 |---|---|
-| `checkToken` | 回调校验 Token。留空则由插件生成并注册到如流；填了就必须和如流后台一致 |
-| `encodingAESKey` | 消息加密 AES Key。留空则由插件生成（16 字节随机 → 22 位 Base64URLSafe） |
+| `checkToken` | 回调校验 Token。填如流后台「接收消息服务器」里的值；开了 `autoRegisterCallback` 才可留空 |
+| `encodingAESKey` | 消息加密 AES Key（22 位 Base64URLSafe）。同上，填后台里的值 |
 | `agentId` | 机器人 ID。留空时发消息不带 `agentid` 字段，只影响部分需要它的接口 |
 
 `appKey` 和 `appSecret` 是如流**发给你的**应用凭证（用来换 `app_access_token` 发消息）；

@@ -2,17 +2,18 @@
 # 再把下面尖括号里的值替换成你自己的真实配置。
 # 不要把填好真实值的文件提交到 GitHub。
 #
-# 只需要 appKey + appSecret 两项：checkToken / encodingAESKey 留空时，插件会随机生成
-# 一组并调 POST /api/v1/imRobot/updateReCallUrl 注册到如流机器人后台（生成的值落在
-# <profile>/.dsh-ruliu/callback.json）。也可以自己填，但要和如流后台一致。
+# 需要 appKey + appSecret + 如流后台「接收消息服务器」里的 checkToken / encodingAESKey。
+# autoRegisterCallback: true 时后两项可留空（插件生成并调 updateReCallUrl 注册），但实测
+# 在已配过回调的机器人上新 AESKey 不一定生效，会导致推来的消息解不开 —— 默认关闭。
 - id: dsh-ruliu
   config:
     enabled: true
     appKey: '<这里填如流开放平台的 AppKey>'
     appSecret: '<这里填如流开放平台的 AppSecret>'
     agentId: 123456                 # 机器人 Agent ID，只填数字；不需要可以留空
-    checkToken: ''                  # 留空 = 插件生成并注册
-    encodingAESKey: ''              # 留空 = 插件生成并注册
+    checkToken: '<如流后台「接收消息服务器」里的 Token>'
+    encodingAESKey: '<同一个页面里的 EncodingAESKey，22 位>'
+    autoRegisterCallback: false      # true 时上面两项可留空，由插件生成并注册（有风险，见 README）
     apiHost: 'https://api.im.baidu.com' # 百度内网可改为 http://apiin.im.baidu.com
     webhookPath: '/dsh-ruliu/webhook'
     publicCallbackUrl: ''           # 如流能访问到的完整回调地址；留空 = 自动推导

@@ -33,6 +33,9 @@ import { Config, validateConfiguration } from './lib/config.mjs'
 import {
   deriveCallbackURL, generateAESKey, generateCheckToken, registerCallback,
 } from './lib/callback.mjs'
+import {
+  buildAnswers, buildApprovalOutcome, parseAnswerInput, renderApproval, renderQuestions,
+} from './lib/interactions.mjs'
 
 export { Config }
 
@@ -276,6 +279,17 @@ class SessionMap {
   }
 
   /**
+   * 已知的如流会话 id 列表。
+   *
+   * 用途：收消息失败（解不开密文）时，出站仍然是通的 —— 可以往已知会话发一条告警，
+   * 把「静默卡住」变成用户看得见的错误。
+   * @returns chatId 数组。
+   */
+  knownChats() {
+    return [...this.byChat.keys()]
+  }
+
+  /**
    * @param sessionId - DSH 会话 id。
    * @returns 该会话绑定的如流 chatId，或 undefined。
    */
@@ -340,26 +354,33 @@ function mountTransport(ctx, config = {}) {
   const sessions = new SessionMap(join(stateDir, 'sessions.json'), logger)
   const log = createFileLog(stateDir)
 
-  // ---- 凭证：AppKey/AppSecret 必须由用户填；token/AESKey 缺了就自己生成 ----
+  // ---- 凭证：AppKey/AppSecret 必须由用户填；token/AESKey 默认也要用户填 ----
   //
-  // 依据官方 SDK：token 和 encodingAesKey 是调用方生成后调 updateReCallUrl 告诉
-  // 如流的，不是如流下发的。所以用户只填两个字段也能跑：这里生成一次并落盘，
-  // 之后重启复用同一组（换 key 会让如流那边的旧值对不上，握手 403）。
+  // 官方 SDK 说 token/encodingAesKey 是调用方生成后调 updateReCallUrl 告诉如流的，
+  // 但实测：**在如流后台已经配过「接收消息服务器」的机器人上，接口带过去的新 AESKey
+  // 不一定被消息管道采用** —— 表现是如流推来的消息解不开（webhook 回 500
+  // decryption failed），而且它不回显落库内容，没法从响应判断。
+  // 所以自动生成改成显式开关（config.autoRegisterCallback，默认 false）：
+  // 默认要求把如流后台里的 Token/AESKey 填进配置，行为可预期。
   const storedCallback = readCallbackState(stateDir)
   const configuredToken = String(config.checkToken ?? '').trim()
   const configuredAESKey = String(config.encodingAESKey ?? '').trim()
   const storedToken = String(storedCallback.checkToken ?? '')
   const storedAESKey = String(storedCallback.encodingAESKey ?? '')
-  // 只有「配置里没有、上次也没存过」才算新生成 —— 复用旧值时不该再注册一遍，
-  // 否则每次挂载都会去动如流后台的注册。
-  const generatedToken = configuredToken === '' && storedToken === ''
-  const generatedAESKey = configuredAESKey === '' && storedAESKey === ''
-  const checkToken = configuredToken || storedToken || generateCheckToken()
-  const encodingAESKey = configuredAESKey || storedAESKey || generateAESKey()
-  const credentialsGenerated = generatedToken || generatedAESKey
+  const autoRegister = config.autoRegisterCallback === true
+  const missingToken = configuredToken === '' && storedToken === ''
+  const missingAESKey = configuredAESKey === '' && storedAESKey === ''
+  const credentialsGenerated = autoRegister && (missingToken || missingAESKey)
+  const checkToken = configuredToken || storedToken || (autoRegister ? generateCheckToken() : '')
+  const encodingAESKey = configuredAESKey || storedAESKey || (autoRegister ? generateAESKey() : '')
   if (credentialsGenerated) {
     writeCallbackState(stateDir, { ...storedCallback, checkToken, encodingAESKey })
     log('credentials-resolved', { generated: true, aesKeyChars: encodingAESKey.length })
+  } else if (missingToken || missingAESKey) {
+    // 不自动生成时给出明确指引：去如流后台复制这两个值填进来
+    logger?.warn?.('dsh-ruliu: 缺少 %s，请在「设置 → 如流」里填如流后台「接收消息服务器」里的值（或打开 autoRegisterCallback 让插件生成并注册）',
+      [missingToken ? 'checkToken' : '', missingAESKey ? 'encodingAESKey' : ''].filter((part) => part !== '').join(' + '))
+    log('credentials-missing', { checkToken: missingToken, encodingAESKey: missingAESKey })
   }
 
   const client = createRuliuClient({ ...config, checkToken, encodingAESKey }, logger)
@@ -471,6 +492,7 @@ function mountTransport(ctx, config = {}) {
     '`/new [提示词]` — 开一个新会话（可带首条提示词）',
     '`/list` — 列出最近的会话（别名 `/sessions`）',
     '`/use <序号>` — 把本聊天切到 `/list` 里的某个会话',
+    '`/1` `/2` … — 回答审批或模型提问（有等待项时；多问题按顺序 `/1 2`，多选 `/1,3`）',
     '`/end` — 结束当前绑定，下条消息会开新会话',
     '`/status` — 看当前绑定的会话与模型',
     '`/help` — 显示这条帮助',
@@ -657,6 +679,22 @@ function mountTransport(ctx, config = {}) {
     if (cmd === '/help' || cmd === '/?') {
       await client.sendText(chatId, helpText())
       return { handled: true }
+    }
+
+    // ---- 待答交互（审批 / 模型提问）：`/1` `/2` …，无选项时直接回文字 ----
+    const pendingAsk = pendingAsks.get(chatId)
+    if (pendingAsk !== undefined) {
+      const parsed = parseAnswerInput(input)
+      if (parsed.picked !== undefined) {
+        log('command-answer', { chatId, picked: parsed.picked })
+        pendingAsk.resolve({ picked: parsed.picked })
+        return { handled: true }
+      }
+      if (pendingAsk.expectsText && !input.startsWith('/')) {
+        log('command-answer-text', { chatId, chars: input.length })
+        pendingAsk.resolve({ text: parsed.text })
+        return { handled: true }
+      }
     }
 
     if (cmd === '/status') {
@@ -862,6 +900,12 @@ function mountTransport(ctx, config = {}) {
       // 平台要求的应答（challenge 回显 / 403 / 400 / 500）原样返回
       if (parsed?.kind === 'reply') {
         log('respond-reply', { status: parsed.status, body: String(parsed.body).slice(0, 60) })
+        // 解密失败 = 插件和如流后台的 AESKey 不一致（典型成因：密钥被重新生成过）。
+        // 出站还是通的，所以主动往已知会话发一条告警 —— 否则用户只会看到"发消息没反应"。
+        if (parsed.status === 500 && String(parsed.body) === 'decryption failed') {
+          log('decrypt-failed', { bytes: raw.length })
+          warnDecryptFailure()
+        }
         send(res, parsed.status, parsed.contentType, parsed.body)
         return
       }
@@ -914,6 +958,113 @@ function mountTransport(ctx, config = {}) {
       send(res, 200, 'application/json; charset=utf-8', JSON.stringify(result))
     },
   }), 'dsh-ruliu: 回调注册路由')
+
+  // ---- 审批桥 / 提问桥：把「等你回答」的东西推到如流，回 `/1` `/2` 结算 ----
+  //
+  // 用 prepend 抢在 Web 转发器前面：`approval/request` 和 `user-questions/request`
+  // 都是 waterfall，宿主会把它们转发给浏览器（dsh-api-remotes），而那个转发器比本插件
+  // 先注册 —— 不抢的话请求永远先落到 Web GUI，如流这边什么都看不到。
+  // 只接管「由如流驱动的会话」；其它会话一律 next() 交回 Web GUI。
+  /** chatId → 待答项：{ expectsText, resolve }。一次只有一个。 */
+  const pendingAsks = new Map()
+
+  /**
+   * 发一条待答消息到如流，并等用户回答。
+   *
+   * 故意不设超时：Web GUI 也是"一直等着"的语义。只有回合被取消（signal abort）或
+   * 发送失败才收尾 —— 发送失败会让调用方 next() 交回 Web GUI，避免把回合挂死。
+   * @param chatId - 如流会话 id。
+   * @param text - 待答消息正文（自带 `/1`、`/2` 提示）。
+   * @param options - { signal, expectsText }。
+   * @returns {Promise<{sent: boolean, picked?: number[][], text?: string}>}
+   */
+  const askInRuliu = async (chatId, text, options = {}) => {
+    try {
+      await client.sendText(chatId, text)
+    } catch (error) {
+      log('ask-send-failed', { chatId, error: describeError(error) })
+      return { sent: false }
+    }
+    return await new Promise((resolve) => {
+      // 同一个聊天只留一个待答项：旧的按"取消"结算，避免回答张冠李戴
+      pendingAsks.get(chatId)?.resolve({})
+      const entry = { expectsText: options.expectsText === true }
+      entry.resolve = (value) => {
+        if (pendingAsks.get(chatId) === entry) pendingAsks.delete(chatId)
+        resolve({ sent: true, ...value })
+      }
+      pendingAsks.set(chatId, entry)
+      const signal = options.signal
+      if (signal !== undefined) {
+        if (signal.aborted) {
+          entry.resolve({})
+          return
+        }
+        signal.addEventListener('abort', () => entry.resolve({}), { once: true })
+      }
+    })
+  }
+
+  ctx.effect(() => ctx.on('approval/request', async (req, next) => {
+    const chatId = sessions.chatOf(req?.agent?.session?.id)
+    if (chatId === undefined) return next()
+    const reason = String(req?.reason ?? req?.displayReason?.zh ?? req?.displayReason?.en ?? '')
+    const answer = await askInRuliu(chatId, renderApproval({ toolName: req?.toolName, reason }), { signal: req?.signal })
+    if (!answer.sent) return next()
+    const outcome = buildApprovalOutcome(answer.picked) ?? 'cancelled'
+    log('approval-answered', { chatId, toolName: req?.toolName, callId: req?.callId, outcome })
+    return outcome
+  }, { prepend: true }), 'dsh-ruliu: 审批桥')
+
+  ctx.effect(() => ctx.on('user-questions/request', async (request, next) => {
+    const agent = request?.agent
+    const chatId = sessions.chatOf(agent?.session?.id)
+    if (chatId === undefined) return next()
+    const questions = Array.isArray(request?.questions) ? request.questions : []
+    if (questions.length === 0) return next()
+    const expectsText = questions.some((question) => !Array.isArray(question?.options) || question.options.length === 0)
+    const answer = await askInRuliu(chatId, renderQuestions(questions), { signal: request?.signal, expectsText })
+    if (!answer.sent) return next()
+    const choice = answer.picked === undefined
+      ? (answer.text === undefined ? undefined : { text: answer.text })
+      : { picked: answer.picked }
+    const answers = choice === undefined ? undefined : buildAnswers(questions, choice)
+    if (answers === undefined) return next()
+    // ask_user_question 默认 120 秒就超时：超时后问题变成 continued，只能用
+    // answer() 按"迟到回复"补交；仍在等的问题 answer() 返回 false，交给返回值结算。
+    const callId = request?.wait?.callId
+    const userQuestions = ctx.get?.('userQuestions')
+    if (callId !== undefined && agent !== undefined && typeof userQuestions?.answer === 'function') {
+      try {
+        if (userQuestions.answer(agent, callId, { answers }) === true) log('question-answered-late', { chatId, callId })
+      } catch (error) {
+        log('question-answer-failed', { chatId, callId, error: describeError(error) })
+      }
+    }
+    log('question-answered', { chatId, callId, count: answers.length })
+    return { answers }
+  }, { prepend: true }), 'dsh-ruliu: 提问桥')
+
+  // ---- 解密失败告警：出站不依赖 AESKey，所以还能把话说明白 ----
+  /** 同一类故障 10 分钟最多提醒一次，避免刷屏。 */
+  let lastDecryptWarnAt = 0
+
+  /**
+   * 如流推来的消息解不开时，主动往已知会话发一条告警。
+   *
+   * 没有这个的话，用户只会看到「在如流发消息没反应」—— 因为解密失败发生在入站，
+   * 模型那边根本不知道有人说过话。
+   */
+  const warnDecryptFailure = () => {
+    const now = Date.now()
+    if (now - lastDecryptWarnAt < 10 * 60 * 1000) return
+    lastDecryptWarnAt = now
+    const chatId = sessions.knownChats()[0]
+    if (chatId === undefined) return
+    void client.sendText(chatId, '⚠️ 如流推来的消息解不开：插件里的 encodingAESKey 和如流后台「接收消息服务器」里的不一致（多半是密钥被重新生成过）。请在「设置 → 如流」里核对，或打开 autoRegisterCallback 让插件重新注册。')
+      .then(() => log('decrypt-warned', { chatId }))
+      .catch((error) => log('decrypt-warn-failed', { chatId, error: describeError(error) }))
+  }
 
   // ---- 出站：把 assistant 文本发回如流 ----
   ctx.effect(() => ctx.on('session/event', (session, event) => {
